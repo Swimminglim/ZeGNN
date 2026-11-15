@@ -1,0 +1,4 @@
+case,graph_k,K,lam_sparse,lam_magnitude
+Housing,8,5,0.1,0.001
+MentalHealth,14,5,0.01,0.001
+PM,12,5,0.001,0.0001

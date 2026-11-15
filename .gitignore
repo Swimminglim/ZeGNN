@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+
+# Generated results
+outputs/
+GLOBAL_Linear/
+RESULT_NonLinear/
+Local Linear/
+*.pt
+*.pth
+*.npy
+*.npz
+*.pkl
+*.log
+
+# System files
+.DS_Store
+__MACOSX/

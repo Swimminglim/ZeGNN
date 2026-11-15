@@ -1,0 +1,13 @@
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+statsmodels
+torch
+pyproj
+libpysal
+esda
+seaborn
+Pillow
+adjustText

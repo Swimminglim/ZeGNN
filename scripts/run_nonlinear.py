@@ -1,0 +1,2480 @@
+# Source extracted without changing numerical model logic from Non-Linear_simulation.ipynb
+# Execute from repository root; see README.md.
+
+
+import os, json, math, time, warnings, itertools
+from dataclasses import dataclass
+from copy import deepcopy
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.patches import Patch
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import matplotlib.image as mpimg
+import statsmodels.api as sm
+from sklearn.model_selection import KFold, GroupKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import r2_score, mean_squared_error, silhouette_score
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+warnings.filterwarnings("ignore")
+
+# Optional Moran
+try:
+    from libpysal.weights import KNN as _KNN_W
+    from esda.moran import Moran as _Moran
+    _HAVE_MORAN = True
+except Exception:
+    _HAVE_MORAN = False
+
+
+# ==============================================================================
+# 1) CONFIG
+# ==============================================================================
+from dataclasses import dataclass
+
+@dataclass
+class CFG:
+    # I/O
+    out_dir: str = "./RESULT_NonLinear"
+    seed: int = 2024
+
+    # Simulation
+    grid_nx: int = 50
+    grid_ny: int = 50
+    p: int = 5
+    k_true: int = 3
+
+    # DGP physics (diffusion decoupled)
+    diffusion_k: int = 10
+    jitter: float = 0.02
+    iid_noise: float = 0.12
+    unobs_spatial_strength: float = 0.12
+    diffusion_rho1: float = 0.10
+    fd_eps: float = 0.01
+
+    # Zentropy structure
+    E_idx: tuple = (0, 1, 2)
+    S_idx: tuple = (3, 4)
+
+    # Torch hyperparams
+    hidden: int = 64
+    lr: float = 0.005
+    epochs_final: int = 800
+    patience: int = 60
+
+
+    do_sweep: bool = True
+    GRAPH_K_CANDIDATES: tuple = (6, 8, 10, 12, 14, 16)
+    K_UPPER: int = 5
+    z_K: int = 5  # compatibility alias
+    LAMBDA_SPARSE_LIST: tuple = (0.0, 0.001, 0.005)
+    # occupancy barrier uses lam_sparse instead of lam_balance
+    LAMBDA_MAGNITUDE_LIST: tuple = (0.001, 0.01)
+
+    # Defaults overwritten by sweep
+    graph_k: int = 12
+    lam_sparse: float = 0.001
+    lam_mag: float = 0.001
+    lam_entropy: float = 0.0  # compatibility alias after removing entropy sweep
+    lam_balance: float = 0.001  # compatibility alias -> mirrors lam_sparse
+
+    # CV
+    cv_folds: int = 5
+    block_nx: int = 5
+    block_ny: int = 5
+
+    # GWR
+    gwr_bw_min: int = 40
+    gwr_bw_grid: tuple = (40, 60, 80, 100, 140, 180, 220)
+
+    # Moran residual kNN
+    moran_knn: int = 8
+
+    # Plotting
+    dpi: int = 300
+
+    # Paper-style figure controls
+    PAPER_STYLE: bool = True
+    USE_SEABORN: bool = True
+
+    FONT_FAMILY: str = "DejaVu Sans"
+    BASE_FONTSIZE: int = 11
+    TITLE_FONTSIZE: int = 15
+    LABEL_FONTSIZE: int = 12
+    TICK_FONTSIZE: int = 11
+    LEGEND_FONTSIZE: int = 11
+    GRID_ALPHA: float = 0.25
+
+    # Scatter/map defaults
+    MAP_S: float = 24.0
+    MAP_ALPHA: float = 0.70
+    SCATTER_S: float = 30.0
+    SCATTER_ALPHA: float = 0.70
+    LINE_W: float = 2.2
+
+    # Figure toggles
+    FIGB_SHOW_TRENDS: bool = False
+    SENS_MAX_VARS: int = 5
+
+    # Colormaps
+    CMAP_SEQ: str = "cividis"
+    CMAP_UNC: str = "viridis"
+    CMAP_DIVERGE: str = "RdBu_r"
+
+    # Regime palette (optional). If None, uses matplotlib tab10.
+    REGIME_CMAP: dict | None = None
+    REGIME_LABEL_OFFSET: int = 1
+    DF_GWR_FIXED_VLIM: float | None = 1.0
+
+
+
+# ==============================================================================
+# 2) UTILITIES / STYLE
+# ==============================================================================
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def apply_paper_style(cfg: CFG):
+    if not getattr(cfg, "PAPER_STYLE", True):
+        return
+
+    # seaborn is optional; if installed, it improves defaults
+    if getattr(cfg, "USE_SEABORN", True):
+        try:
+            import seaborn as sns
+            sns.set_theme(style="whitegrid", context="paper", font=cfg.FONT_FAMILY)
+            sns.set_style({"axes.grid": True, "grid.alpha": cfg.GRID_ALPHA})
+        except Exception:
+            pass
+
+    import matplotlib as mpl
+    mpl.rcParams["figure.dpi"] = cfg.dpi
+    mpl.rcParams["savefig.dpi"] = cfg.dpi
+    mpl.rcParams["savefig.bbox"] = "tight"
+    mpl.rcParams["savefig.pad_inches"] = 0.03
+
+    mpl.rcParams["font.family"] = "sans-serif"
+    mpl.rcParams["font.sans-serif"] = [cfg.FONT_FAMILY, "Arial", "Helvetica", "DejaVu Sans"]
+
+    mpl.rcParams["font.size"] = cfg.BASE_FONTSIZE
+    mpl.rcParams["axes.titlesize"] = cfg.TITLE_FONTSIZE
+    mpl.rcParams["axes.labelsize"] = cfg.LABEL_FONTSIZE
+    mpl.rcParams["xtick.labelsize"] = cfg.TICK_FONTSIZE
+    mpl.rcParams["ytick.labelsize"] = cfg.TICK_FONTSIZE
+    mpl.rcParams["legend.fontsize"] = cfg.LEGEND_FONTSIZE
+
+    mpl.rcParams["axes.spines.top"] = False
+    mpl.rcParams["axes.spines.right"] = False
+    mpl.rcParams["axes.linewidth"] = 0.8
+    mpl.rcParams["grid.alpha"] = cfg.GRID_ALPHA
+    mpl.rcParams["grid.linewidth"] = 0.6
+
+    # Make PDFs/PS text selectable
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def std_z(v):
+    v = np.asarray(v)
+    return (v - np.nanmean(v, axis=0)) / (np.nanstd(v, axis=0) + 1e-12)
+
+
+def symm_limits(a, q=99.0):
+    a = np.asarray(a)
+    v = np.nanpercentile(np.abs(a), q)
+    if (not np.isfinite(v)) or v <= 0:
+        v = 1.0
+    return -v, v
+
+
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+def _get_diverging_cmap(name="RdBu_r"):
+    try:
+        import matplotlib as mpl
+        try:
+            return mpl.colormaps.get_cmap(name)
+        except Exception:
+            return plt.get_cmap(name)
+    except Exception:
+        return plt.cm.RdBu_r
+
+def _get_sequential_cmap(name="viridis"):
+    try:
+        import matplotlib as mpl
+        try:
+            return mpl.colormaps.get_cmap(name)
+        except Exception:
+            return plt.get_cmap(name)
+    except Exception:
+        return plt.cm.viridis
+
+
+def _get_regime_cmap(cfg, uniq_labels):
+    """Return dict {label: color}."""
+    try:
+        rc = getattr(cfg, "REGIME_CMAP")
+        if isinstance(rc, dict) and len(rc) > 0:
+            return rc
+    except Exception:
+        pass
+    colors = list(plt.cm.tab10.colors)
+    return {int(lab): colors[i % len(colors)] for i, lab in enumerate(sorted(list(uniq_labels)))}
+
+
+def _get_regime_colors(K: int, preferred="Dark2"):
+    """
+    Use a consistent color palette for true and predicted regimes.
+    - For up to eight regimes, use Dark2 for print legibility.
+    - For larger regime counts, use tab20.
+    """
+    K = int(K)
+    if K <= 0:
+        return []
+    try:
+        cmap = matplotlib.colormaps.get_cmap(preferred)
+        if getattr(cmap, "N", 0) >= K:
+            return [cmap(i) for i in range(K)]
+    except Exception:
+        pass
+
+    try:
+        cmap = matplotlib.colormaps.get_cmap("tab20")
+        return [cmap(i % 20) for i in range(K)]
+    except Exception:
+        return list(plt.cm.tab10.colors)[:K]
+
+def _map_symm_vlim(vals, q=98, floor=1.0):
+    """
+    Use robust symmetric color limits to maintain visible differences.
+    """
+    v = np.asarray(vals).reshape(-1)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float(-floor), float(floor)
+    vmax = float(np.nanpercentile(np.abs(v), q))
+    if (not np.isfinite(vmax)) or vmax <= 0:
+        vmax = float(floor)
+    vmax = max(vmax, float(floor))
+    return -vmax, vmax
+
+def _paper_map_axes(ax):
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_aspect("equal", adjustable="box")
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+
+def _add_cbar_right(ax, mappable, label, size="3.5%", pad=0.04):
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size=size, pad=pad)
+    cb = plt.colorbar(mappable, cax=cax)
+    if label:
+        cb.set_label(label)
+    return cb
+
+def _clean_ax(ax):
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def _paper_ax(ax, grid=True, alpha=0.25):
+    ax.set_axisbelow(True)
+    if grid:
+        ax.grid(True, linewidth=0.7, alpha=alpha)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def _make_blocks(coords, nx, ny):
+    coords = np.asarray(coords)
+    x, y = coords[:, 0], coords[:, 1]
+    xb = np.digitize(x, np.linspace(x.min(), x.max(), nx + 1)) - 1
+    yb = np.digitize(y, np.linspace(y.min(), y.max(), ny + 1)) - 1
+    return np.clip(yb * nx + xb, 0, nx * ny - 1)
+
+
+def smooth_knn_field(coords, val, k=10, steps=2):
+    coords = np.asarray(coords)
+    val = np.asarray(val).astype(float)
+    nbrs = NearestNeighbors(n_neighbors=k + 1).fit(coords)
+    _, idx = nbrs.kneighbors(coords)
+    v = val.copy()
+    for _ in range(steps):
+        v_new = np.zeros_like(v)
+        for i in range(len(v)):
+            v_new[i] = 0.5 * v[i] + 0.5 * v[idx[i, 1:]].mean()
+        v = v_new
+    return std_z(v)
+
+
+def make_knn_edges(coords, k):
+    coords = np.asarray(coords)
+    nbrs = NearestNeighbors(n_neighbors=int(k) + 1).fit(coords)
+    _, idx = nbrs.kneighbors(coords)
+    src, dst = [], []
+    for i in range(len(coords)):
+        for j in idx[i, 1:]:
+            src.append(i); dst.append(j)
+            src.append(j); dst.append(i)
+    return np.array([src, dst], dtype=np.int64)
+
+
+def disconnect_train_test_edges(edges, train_mask):
+    u = edges[0]
+    v = edges[1]
+    tm_u = train_mask[u]
+    tm_v = train_mask[v]
+    keep = (tm_u & tm_v) | ((~tm_u) & (~tm_v))
+    return edges[:, keep]
+
+
+def moran_residuals(resid, coords, k=8):
+    if not _HAVE_MORAN:
+        return np.nan, np.nan
+    w = _KNN_W.from_array(np.asarray(coords), k=int(k))
+    mi = _Moran(np.asarray(resid), w)
+    return float(mi.I), float(mi.p_sim)
+
+
+def _safe_save_error_figure(out_path, title, err):
+    fig = plt.figure(figsize=(8, 3), dpi=200)
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    ax.text(0.01, 0.80, title, fontsize=12, fontweight="bold")
+    ax.text(0.01, 0.50, "Figure failed with exception:", fontsize=10)
+    ax.text(0.01, 0.25, str(err), fontsize=9, family="monospace")
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def safe_run_figure(fn, out_path, *args, **kwargs):
+    """Run a paper figure strictly; never save an error placeholder as a successful figure.
+
+    Research models, CV and figure calculations are unchanged.
+    """
+    try:
+        fn(*args, out_path=out_path, **kwargs)
+    except TypeError as exc:
+        # Historical plotting functions use either keyword or positional out_path.
+        # Preserve the original fallback but report failures instead of an error-PNG.
+        try:
+            fn(*args, out_path, **kwargs)
+        except Exception as second:
+            raise RuntimeError(f"Figure generation failed: {fn.__name__} -> {out_path}: {second}") from second
+    except Exception as exc:
+        raise RuntimeError(f"Figure generation failed: {fn.__name__} -> {out_path}: {exc}") from exc
+    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"Figure was not created: {fn.__name__} -> {out_path}")
+
+
+def _confusion(true_lab, pred_lab, Kt, Kp):
+    M = np.zeros((Kt, Kp), dtype=int)
+    for t, p in zip(true_lab, pred_lab):
+        if 0 <= t < Kt and 0 <= p < Kp:
+            M[t, p] += 1
+    return M
+
+def best_perm_match_true_pred(true_lab, pred_lab):
+    true_lab = np.asarray(true_lab).astype(int)
+    pred_lab = np.asarray(pred_lab).astype(int)
+    Kt = int(np.max(true_lab) + 1)
+    Kp = int(np.max(pred_lab) + 1)
+    M = _confusion(true_lab, pred_lab, Kt, Kp)
+
+    # map pred -> true (length Kp). if Kp>Kt allow some pred map to same true? (we avoid; pick best injective onto min(Kt,Kp))
+    K = min(Kt, Kp)
+
+    best_score = -1
+    best_map = None
+
+    # choose K pred labels to match to K true labels, if unequal sizes handle gracefully
+    true_ids = list(range(Kt))
+    pred_ids = list(range(Kp))
+
+    # simplest: if Kt==Kp small, brute force permutation of pred to true
+    if Kt == Kp and Kp <= 7:
+        for perm in itertools.permutations(range(Kp)):
+            score = sum(M[t, perm[t]] for t in range(Kt))
+            if score > best_score:
+                best_score = score
+                best_map = {perm[t]: t for t in range(Kt)}  # pred -> true
+    else:
+        # general: try all assignments for min size (bruteforce over combinations + perms)
+        # works for small K (your default 3~5 is fine)
+        if K <= 7:
+            for chosen_pred in itertools.combinations(pred_ids, K):
+                for perm in itertools.permutations(chosen_pred, K):
+                    # match first K true labels to these pred labels
+                    score = sum(M[t, perm[t]] for t in range(K))
+                    if score > best_score:
+                        best_score = score
+                        best_map = {perm[t]: t for t in range(K)}
+            # for leftover pred labels (if any), map to argmax true row
+            if best_map is None:
+                best_map = {p: int(np.argmax(M[:, p])) for p in pred_ids}
+            else:
+                for p in pred_ids:
+                    if p not in best_map:
+                        best_map[p] = int(np.argmax(M[:, p]))
+        else:
+            # fallback greedy (shouldn't happen for your K)
+            best_map = {p: int(np.argmax(M[:, p])) for p in pred_ids}
+
+    return best_map, M
+def apply_perm_to_zentropy_outputs(p, F_k, E_k, S_k, pred_reg, perm_map, K_true=None):
+    """
+    perm_map: dict {old_pred_label -> new_label(=true label index)}
+    Returns permuted versions with columns reordered to match true regime IDs.
+    """
+    p = np.asarray(p)
+    F_k = np.asarray(F_k); E_k = np.asarray(E_k); S_k = np.asarray(S_k)
+    pred_reg = np.asarray(pred_reg).astype(int)
+
+    Kp = p.shape[1]
+    if K_true is None:
+        K_true = max(perm_map.values()) + 1
+
+    # build column index order for new labels 0..K_true-1
+    # inv_map[new_label] = old_label
+    inv_map = {new: old for old, new in perm_map.items()}
+    col_old_for_new = []
+    for new in range(K_true):
+        if new in inv_map:
+            col_old_for_new.append(inv_map[new])
+        else:
+            # if missing, pick something (shouldn't happen if K_true==Kp==Kt)
+            col_old_for_new.append(0)
+    col_old_for_new = np.array(col_old_for_new, dtype=int)
+
+    p_new  = p[:, col_old_for_new]
+    Fk_new = F_k[:, col_old_for_new]
+    Ek_new = E_k[:, col_old_for_new]
+    Sk_new = S_k[:, col_old_for_new]
+
+    # renumber pred_reg
+    pred_reg_new = np.vectorize(lambda z: perm_map.get(int(z), int(z)))(pred_reg).astype(int)
+
+    return p_new, Fk_new, Ek_new, Sk_new, pred_reg_new
+
+# ==============================================================================
+# 3) SIMULATION ENGINE
+# ==============================================================================
+def make_regimes_voronoi(coords, K, rng):
+    centers = rng.uniform(0.15, 0.85, size=(K, 2))
+    dists = np.sum((coords[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+    return np.argmin(dists, axis=1).astype(int)
+
+
+def true_mechanism_FES(X, regimes):
+    n = X.shape[0]
+    E = np.zeros(n, dtype=float)
+    S = np.zeros(n, dtype=float)
+
+    x1, x2, x3, x4, x5 = [X[:, i] for i in range(5)]
+
+    def sigmoid(z):
+        return 1.0 / (1.0 + np.exp(-z))
+
+    for k in np.unique(regimes):
+        m = (regimes == k)
+        if not np.any(m):
+            continue
+
+        z1, z2, z3, z4, z5 = x1[m], x2[m], x3[m], x4[m], x5[m]
+
+        if k == 0:
+            E[m] = (
+                +2.6 * z1
+                +2.2 * np.tanh(2.0 * z2)
+                +1.6 * (z3**2 - 1.0)
+            )
+            S[m] = (
+                2.0 * (sigmoid(2.5 * z4) - 0.5)
+                +2.0 * (z5 * np.exp(-0.8 * (z5**2)))
+            )
+
+        elif k == 1:
+            E[m] = (
+                -2.6 * z1
+                +2.0 * (z2**2 - 1.0)
+                +1.8 * np.tanh(2.2 * z3)
+            )
+            S[m] = (
+                0.8 * np.sin(3.0 * z4)
+                +0.9 * (sigmoid(2.0 * z5) - 0.5)
+            )
+
+        else:
+            E[m] = (
+                +0.9 * z1
+                +2.6 * (z2 * z3)
+            )
+            S[m] = (
+                1.7 * np.sin(3.2 * z4)
+                +1.5 * (z5**2 - 1.0)
+            )
+
+    Fv = E - S
+    return Fv, E, S
+
+
+def fd_local_grads_FES(X, regimes, eps=0.01):
+    n, p = X.shape
+    dF = np.zeros((n, p))
+    dE = np.zeros((n, p))
+    dS = np.zeros((n, p))
+
+    for j in range(p):
+        Xp = X.copy(); Xm = X.copy()
+        Xp[:, j] += eps
+        Xm[:, j] -= eps
+        Fp, Ep, Sp = true_mechanism_FES(Xp, regimes)
+        Fm, Em, Sm = true_mechanism_FES(Xm, regimes)
+        dF[:, j] = (Fp - Fm) / (2 * eps)
+        dE[:, j] = (Ep - Em) / (2 * eps)
+        dS[:, j] = (Sp - Sm) / (2 * eps)
+
+    return dF, dE, dS
+
+
+def generate_simulation(cfg: CFG):
+    rng = np.random.default_rng(cfg.seed)
+
+    xs = np.linspace(0, 1, cfg.grid_nx)
+    ys = np.linspace(0, 1, cfg.grid_ny)
+    xx, yy = np.meshgrid(xs, ys)
+    coords = np.column_stack([xx.ravel(), yy.ravel()])
+    coords = coords + rng.normal(0, cfg.jitter, size=coords.shape)
+
+    coords_std = std_z(coords)
+
+    regimes = make_regimes_voronoi(coords, cfg.k_true, rng)
+
+    X_raw = np.zeros((len(coords), cfg.p), dtype=float)
+    for j in range(cfg.p):
+        base = rng.normal(0, 1, size=len(coords))
+        X_raw[:, j] = smooth_knn_field(coords_std, base, k=15, steps=3)
+
+    X_std = std_z(X_raw)
+
+    F_base, E_true, S_true = true_mechanism_FES(X_std, regimes)
+    K_true = int(np.max(regimes)) + 1
+    p_true = smooth_regime_memberships(coords_std, regimes, K_true, k=12, steps=2, tau=1.20)
+    H_true = -np.sum(p_true * np.log(p_true + 1e-12), axis=1)
+    H_true_norm = H_true / max(np.log(max(2, K_true)), 1e-12)
+    T_true = np.linspace(0.8, 1.2, K_true)
+    T_eff_true = (p_true * T_true[None, :]).sum(axis=1)
+    F_true = F_base + T_eff_true * H_true_norm
+
+    nb = NearestNeighbors(n_neighbors=int(cfg.diffusion_k) + 1).fit(coords_std).kneighbors(coords_std)[1][:, 1:]
+
+    def diffuse_vec(v):
+        return np.mean(v[nb], axis=1)
+
+    def diffuse_mat(V):
+        return V[nb].mean(axis=1)
+
+    y_clean = F_true + cfg.diffusion_rho1 * diffuse_vec(F_true)
+
+    u_spatial = smooth_knn_field(
+        coords_std,
+        rng.normal(0, 1, len(coords)),
+        k=20,
+        steps=3
+    ) * cfg.unobs_spatial_strength
+
+    y_raw = y_clean + u_spatial + rng.normal(0, cfg.iid_noise, len(coords))
+
+
+    y_mu = float(np.nanmean(y_raw))
+    y_sd = float(np.nanstd(y_raw) + 1e-12)
+    y_std = (y_raw - y_mu) / y_sd
+
+    dF_true, dE_true, dS_true = fd_local_grads_FES(X_std, regimes, eps=cfg.fd_eps)
+
+    # mechanistic dy_raw dx_std
+    dY_true = dF_true + cfg.diffusion_rho1 * diffuse_mat(dF_true)
+
+
+    dY_true_std = dY_true / y_sd
+
+    return {
+        "coords": coords,
+        "coords_std": coords_std,
+
+        "regimes_true": regimes,
+
+        "X_raw": X_raw,
+        "X_std": X_std,
+
+        "y_raw": y_raw,
+        "y_std": y_std,
+        "y_mu": y_mu,
+        "y_sd": y_sd,
+
+        "F_true_std": std_z(F_true),
+        "E_true_std": std_z(E_true),
+        "S_true_std": std_z(S_true),
+
+        "dF_true": dF_true,
+        "dE_true": dE_true,
+        "dS_true": dS_true,
+
+        "dY_true": dY_true,
+        "dY_true_std": dY_true_std,
+    }
+
+
+
+
+
+def regime_utilization_metrics(p):
+    p = np.asarray(p, dtype=float)
+    eps = 1e-12
+    if p.ndim != 2 or p.shape[0] == 0:
+        return np.nan, np.nan, np.nan
+    mean_p = p.mean(axis=0)
+    H_global = -np.sum(mean_p * np.log(mean_p + eps))
+    n_eff_global = float(np.exp(H_global))
+    H_local = -np.sum(p * np.log(p + eps), axis=1)
+    n_eff_local = float(np.mean(np.exp(H_local)))
+    argmax_share_max = float(np.max(np.bincount(np.argmax(p, axis=1), minlength=p.shape[1]) / p.shape[0]))
+    return n_eff_global, n_eff_local, argmax_share_max
+
+
+def smooth_regime_memberships(coords_std, regimes, K, k=12, steps=2, tau=1.25):
+    """Create soft memberships that preserve the original regime shape but allow transition ambiguity."""
+    regimes = np.asarray(regimes).astype(int)
+    p = np.eye(K)[regimes]
+    nbrs = NearestNeighbors(n_neighbors=min(k + 1, len(coords_std))).fit(coords_std)
+    nn = nbrs.kneighbors(coords_std, return_distance=False)[:, 1:]
+    for _ in range(int(steps)):
+        p = 0.5 * p + 0.5 * p[nn].mean(axis=1)
+        p = np.clip(p, 1e-9, None)
+        p /= p.sum(axis=1, keepdims=True)
+    logits = np.log(p + 1e-12) / max(1e-6, float(tau))
+    logits = logits - logits.max(axis=1, keepdims=True)
+    p = np.exp(logits)
+    p /= p.sum(axis=1, keepdims=True)
+    return p
+
+
+# ==============================================================================
+# 4) MODELS
+# ==============================================================================
+class FastGWR:
+    """Lightweight GWR: local weighted least squares with kNN bandwidth."""
+    def __init__(self, coords, X, y, bw):
+        self.coords = np.asarray(coords)
+        self.X = np.asarray(X)
+        self.y = np.asarray(y).ravel()
+        self.bw = int(bw)
+        self.nbrs = NearestNeighbors(n_neighbors=self.bw).fit(self.coords)
+
+    def _get_beta(self, q_coords):
+        dists, idxs = self.nbrs.kneighbors(q_coords.reshape(1, -1))
+        d = dists[0]
+        denom = np.max(d) + 1e-12
+        w = (1 - (d / denom) ** 2) ** 2  # bisquare
+
+        X_sub = self.X[idxs[0]]
+        y_sub = self.y[idxs[0]]
+        X_des = np.column_stack([np.ones(len(X_sub)), X_sub])
+
+        W = np.diag(w)
+        XtW = X_des.T @ W
+        try:
+            beta = np.linalg.solve(XtW @ X_des, XtW @ y_sub)
+        except Exception:
+            beta = np.zeros(X_des.shape[1])
+        return beta
+
+    def predict(self, coords_eval, X_eval, return_coeffs=False):
+        coords_eval = np.asarray(coords_eval)
+        X_eval = np.asarray(X_eval)
+        n = len(coords_eval)
+        preds = np.zeros(n)
+        coeffs = np.zeros((n, X_eval.shape[1]))
+        for i in range(n):
+            beta = self._get_beta(coords_eval[i])
+            preds[i] = beta[0] + np.dot(beta[1:], X_eval[i])
+            coeffs[i] = beta[1:]
+        if return_coeffs:
+            return preds, coeffs
+        return preds
+
+
+def select_gwr_bandwidth_once(coords, X, y, cfg: CFG):
+    n = len(y)
+    grid = []
+    for bw in cfg.gwr_bw_grid:
+        bw2 = max(cfg.gwr_bw_min, int(bw))
+        bw2 = min(bw2, n - 1)
+        grid.append(bw2)
+    grid = sorted(list(set(grid)))
+
+    best_bw = grid[0]
+    best_obj = np.inf
+    k_par = X.shape[1] + 1
+
+    for bw in grid:
+        gwr = FastGWR(coords, X, y, bw)
+        yhat = gwr.predict(coords, X)
+        resid = y - yhat
+        rss = float(np.sum(resid ** 2))
+        obj = rss + 2.0 * k_par
+        if obj < best_obj:
+            best_obj = obj
+            best_bw = bw
+    return int(best_bw)
+
+
+# Torch models
+class MLPReg(nn.Module):
+    def __init__(self, d_in, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+    def forward(self, x):
+        return self.net(x).squeeze(1)
+
+
+class StandardGNN(nn.Module):
+    def __init__(self, d_in, hidden=64):
+        super().__init__()
+        self.fc1 = nn.Linear(d_in, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.out = nn.Linear(hidden, 1)
+    def forward(self, x, edges):
+        h = F.relu(self.fc1(x))
+        row, col = edges
+        aggr = torch.zeros_like(h).index_add_(0, row, h[col])
+        deg = torch.zeros(h.size(0), 1, device=x.device).index_add_(0, row, torch.ones(row.size(0), 1, device=x.device))
+        h = (h + aggr) / (deg + 1.0)
+        h = F.relu(self.fc2(h))
+        return self.out(h).squeeze(1)
+
+
+class ZentropyGNN(nn.Module):
+    """
+    Updated Zentropy model aligned to the final (cell 3) logic.
+    - graph-smoothed gating only
+    - local E/S encoders
+    - entropy-in-F: F = sum_k p_k F_k + T_eff * Hbar
+    """
+    def __init__(self, d_in_E, d_in_S, hidden, K, entropy_in_F=True):
+        super().__init__()
+        self.K = int(K)
+        self.entropy_in_F = bool(entropy_in_F)
+        d_gate = int(d_in_E + d_in_S + 2)
+        self.gate = nn.Sequential(
+            nn.Linear(d_gate, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, self.K)
+        )
+        self.enc_E = nn.Sequential(nn.Linear(d_in_E, hidden), nn.ReLU())
+        self.head_E = nn.Linear(hidden, self.K)
+        self.enc_S = nn.Sequential(nn.Linear(d_in_S, hidden), nn.ReLU())
+        self.head_S = nn.Linear(hidden, self.K)
+        self.T_raw = nn.Parameter(torch.zeros(self.K))
+
+    def _mean_aggregate(self, Z, edges):
+        row, col = edges
+        aggr = torch.zeros_like(Z).index_add_(0, row, Z[col])
+        deg = torch.zeros(Z.size(0), 1, device=Z.device).index_add_(0, row, torch.ones(row.size(0), 1, device=Z.device))
+        return (Z + aggr) / (deg + 1.0)
+
+    def forward(self, x_E, x_S, coords2, edges):
+        gate_in = torch.cat([x_E, x_S, coords2], dim=1)
+        logits = self.gate(gate_in)
+        logits = self._mean_aggregate(logits, edges)
+        p = torch.softmax(logits, dim=1)
+
+        hE = self.enc_E(x_E)
+        E_k = self.head_E(hE)
+
+        if x_S.shape[1] > 0:
+            hS = self.enc_S(x_S)
+            S_k = self.head_S(hS)
+        else:
+            S_k = torch.zeros(x_E.size(0), self.K, device=x_E.device, dtype=x_E.dtype)
+
+        T = F.softplus(self.T_raw) + 1e-6
+        F_k = E_k - S_k * T.view(1, -1)
+        F_mix = (p * F_k).sum(1)
+
+        eps = 1e-9
+        H_raw = -torch.sum(p * torch.log(p + eps), dim=1)
+        if self.K > 1:
+            H_bar = H_raw / (torch.log(torch.tensor(float(self.K), device=H_raw.device, dtype=H_raw.dtype)) + 1e-12)
+        else:
+            H_bar = torch.zeros_like(H_raw)
+        T_eff = torch.sum(p * T.view(1, -1), dim=1)
+        if self.entropy_in_F:
+            F_mix = F_mix + T_eff * H_bar
+
+        E_mix = (p * E_k).sum(1)
+        S_mix = (p * S_k).sum(1)
+        return {"F": F_mix, "E": E_mix, "S": S_mix, "p": p, "F_k": F_k, "E_k": E_k, "S_k": S_k,
+                "T": T, "T_eff": T_eff, "H_node": H_raw, "H_node_norm": H_bar}
+
+
+
+
+def train_torch(model, data_dict, train_mask, edges, cfg: CFG, model_name="DNN", epochs=None):
+    device = get_device()
+    X = torch.tensor(data_dict["X"], dtype=torch.float32, device=device)
+    y = torch.tensor(data_dict["y"], dtype=torch.float32, device=device)
+    c = torch.tensor(data_dict["coords"], dtype=torch.float32, device=device)
+    e = torch.tensor(edges, dtype=torch.long, device=device)
+
+    if model_name == "DNN":
+        model = MLPReg(X.shape[1], cfg.hidden).to(device)
+        ep = epochs or int(cfg.epochs_final * 0.7)
+    elif model_name == "GNN":
+        model = StandardGNN(X.shape[1], cfg.hidden).to(device)
+        ep = epochs or int(cfg.epochs_final * 0.7)
+    elif model_name == "Zentropy":
+        model = ZentropyGNN(len(cfg.E_idx), len(cfg.S_idx), cfg.hidden, cfg.K_UPPER, entropy_in_F=True).to(device)
+        ep = epochs or cfg.epochs_final
+    else:
+        raise ValueError(model_name)
+
+    opt = optim.Adam(model.parameters(), lr=cfg.lr)
+    best = np.inf
+    best_state = None
+    bad = 0
+
+    for _t in range(int(ep)):
+        model.train()
+        opt.zero_grad()
+        if model_name == "DNN":
+            yhat = model(X)
+            loss = F.mse_loss(yhat[train_mask], y[train_mask])
+        elif model_name == "GNN":
+            yhat = model(X, e)
+            loss = F.mse_loss(yhat[train_mask], y[train_mask])
+        else:
+            out = model(X[:, cfg.E_idx], X[:, cfg.S_idx], c, e)
+            mse = F.mse_loss(out["F"][train_mask], y[train_mask])
+            p_tr = out["p"][train_mask]
+            mean_p = p_tr.mean(0)
+            # retain the original sign choice discussed with the user: anti-collapse occupancy barrier
+            sparse_penalty = -torch.sum(torch.log(mean_p + 1e-9))
+            mag = (out["E_k"][train_mask] ** 2).mean() + (out["S_k"][train_mask] ** 2).mean()
+            loss = mse + cfg.lam_sparse * sparse_penalty + cfg.lam_mag * mag
+
+        loss.backward()
+        opt.step()
+
+        val = float(loss.detach().cpu().item())
+        if val < best - 1e-6:
+            best = val
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= cfg.patience:
+                break
+
+    if model_name == "Zentropy" and best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    with torch.no_grad():
+        if model_name == "DNN":
+            yhat = model(X).detach().cpu().numpy()
+            return yhat, model
+        elif model_name == "GNN":
+            yhat = model(X, e).detach().cpu().numpy()
+            return yhat, model
+        else:
+            out = model(X[:, cfg.E_idx], X[:, cfg.S_idx], c, e)
+            return out["F"].detach().cpu().numpy(), model
+
+
+
+
+def zentropy_internals(model: ZentropyGNN, data_dict, edges, cfg: CFG):
+    device = next(model.parameters()).device
+    X = torch.tensor(data_dict["X"], dtype=torch.float32, device=device)
+    c = torch.tensor(data_dict["coords"], dtype=torch.float32, device=device)
+    e = torch.tensor(edges, dtype=torch.long, device=device)
+    with torch.no_grad():
+        out = model(X[:, cfg.E_idx], X[:, cfg.S_idx], c, e)
+    return (
+        out["F"].detach().cpu().numpy(),
+        out["p"].detach().cpu().numpy(),
+        out["F_k"].detach().cpu().numpy(),
+        out["E_k"].detach().cpu().numpy(),
+        out["S_k"].detach().cpu().numpy(),
+        out["E"].detach().cpu().numpy(),
+        out["S"].detach().cpu().numpy(),
+        out["H_node_norm"].detach().cpu().numpy(),
+    )
+
+
+
+
+def zentropy_grads(model: ZentropyGNN, data_dict, edges, cfg: CFG):
+    device = next(model.parameters()).device
+    X = torch.tensor(data_dict["X"], dtype=torch.float32, device=device, requires_grad=True)
+    c = torch.tensor(data_dict["coords"], dtype=torch.float32, device=device)
+    e = torch.tensor(edges, dtype=torch.long, device=device)
+
+    out = model(X[:, cfg.E_idx], X[:, cfg.S_idx], c, e)
+    gF = torch.autograd.grad(out["F"].sum(), X, retain_graph=True)[0]
+    gE = torch.autograd.grad(out["E"].sum(), X, retain_graph=True)[0]
+    gS = torch.autograd.grad(out["S"].sum(), X)[0]
+    return gF.detach().cpu().numpy(), gE.detach().cpu().numpy(), gS.detach().cpu().numpy()
+
+
+# ==============================================================================
+# 5) FIGURES
+
+# ==============================================================================
+# 5) FIGURES
+# ==============================================================================
+def fig_B_true_overview_paper(coords_std, true_reg, y_std, cfg, out_path):
+    coords_std = np.asarray(coords_std)
+    true_reg = np.asarray(true_reg).astype(int)
+    y_std = np.asarray(y_std)
+
+
+    s_map = float(max(getattr(cfg, "MAP_S", 10.0), 14.0))
+    a_map = float(getattr(cfg, "MAP_ALPHA", 0.60))
+    lab_off = int(getattr(cfg, "REGIME_LABEL_OFFSET", 1))
+
+    K = int(np.max(true_reg) + 1)
+    colors = _get_regime_colors(K)
+
+    fig = plt.figure(figsize=(10.8, 4.2), dpi=cfg.dpi)
+    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 1.15], wspace=0.25)
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 1])
+
+    # True regimes
+    for k in range(K):
+        m = (true_reg == k)
+        if np.any(m):
+            ax0.scatter(coords_std[m, 0], coords_std[m, 1],
+                        s=s_map, alpha=a_map, rasterized=True,
+                        color=colors[k], linewidths=0)
+    ax0.set_title("True regimes", fontweight="bold")
+    _paper_map_axes(ax0)
+
+    handles = [Patch(facecolor=colors[k], edgecolor="none", label=str(k + lab_off)) for k in range(K)]
+    ax0.legend(handles=handles, title="Regime", frameon=False, ncol=min(K, 6),
+               bbox_to_anchor=(0.0, -0.10), loc="upper left")
+
+    # Observed y
+    vmin, vmax = _map_symm_vlim(y_std, q=98, floor=1.0)
+    sc = ax1.scatter(coords_std[:, 0], coords_std[:, 1],
+                     c=y_std, s=s_map, alpha=a_map, rasterized=True,
+                     cmap=_get_diverging_cmap(getattr(cfg, "CMAP_DIVERGE", "RdBu_r")),
+                     vmin=vmin, vmax=vmax, linewidths=0)
+    ax1.set_title("Observed outcome y", fontweight="bold")
+    _paper_map_axes(ax1)
+    cb = fig.colorbar(sc, ax=ax1, fraction=0.046, pad=0.02)
+    cb.set_label("y")
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_B_dashboard_paper(coords_std, true_reg, pred_reg, unc01, mean_p,
+                          y_std, F_pred_std, E_pred_std, S_pred_std,
+                          cfg, out_path):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    # -----------------------------
+    # local helpers (self-contained)
+    # -----------------------------
+    def _paper_map_axes(ax):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect("equal", adjustable="box")
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+    def _add_cbar_right(ax, mappable, label):
+        div = make_axes_locatable(ax)
+        cax = div.append_axes("right", size="3.8%", pad=0.04)
+        cb = plt.colorbar(mappable, cax=cax)
+        cb.set_label(label)
+        return cb
+
+    def _map_symm_vlim(vals, q=98, floor=1.0):
+        vals = np.asarray(vals).reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return -floor, floor
+        vmax = np.nanpercentile(np.abs(vals), q)
+        if (not np.isfinite(vmax)) or (vmax <= 0):
+            vmax = floor
+        vmax = max(float(vmax), float(floor))
+        return -vmax, vmax
+
+    def _get_regime_colors(K):
+        base = list(plt.cm.tab10.colors) + list(plt.cm.tab20.colors)
+        if K <= len(base):
+            return base[:K]
+        cmap = plt.get_cmap("tab20", K)
+        return [cmap(i) for i in range(K)]
+
+    def _get_seq_cmap(name):
+        try:
+            return plt.get_cmap(name)
+        except Exception:
+            return plt.get_cmap("viridis")
+
+    def _get_div_cmap(name):
+        try:
+            return plt.get_cmap(name)
+        except Exception:
+            return plt.get_cmap("RdBu_r")
+
+    # -----------------------------
+    # inputs
+    # -----------------------------
+    coords_std = np.asarray(coords_std, float)
+    true_reg = np.asarray(true_reg).astype(int)
+    pred_reg = np.asarray(pred_reg).astype(int)
+    unc01 = np.asarray(unc01).astype(float)
+
+    y_std = np.asarray(y_std).astype(float)
+    F_pred_std = np.asarray(F_pred_std).astype(float)
+    E_pred_std = np.asarray(E_pred_std).astype(float)
+    S_pred_std = np.asarray(S_pred_std).astype(float)
+
+    s_map = float(max(getattr(cfg, "MAP_S", 10.0), 14.0))
+    a_map = float(getattr(cfg, "MAP_ALPHA", 0.62))
+    dpi = int(getattr(cfg, "dpi", 300))
+    lab_off = int(getattr(cfg, "REGIME_LABEL_OFFSET", 1))
+
+    K = int(np.max(true_reg) + 1)
+    colors = _get_regime_colors(K)
+
+    cmap_unc = _get_seq_cmap(getattr(cfg, "CMAP_UNC", "viridis"))
+    cmap_div = _get_div_cmap(getattr(cfg, "CMAP_DIVERGE", "RdBu_r"))
+
+    # shared diverging limits for bottom row
+    allv = np.concatenate([
+        y_std.ravel(),
+        F_pred_std.ravel(),
+        E_pred_std.ravel(),
+        S_pred_std.ravel()
+    ])
+    vmin_all, vmax_all = _map_symm_vlim(allv, q=98, floor=1.0)
+
+    # -----------------------------
+    # figure layout
+    # top row: 3 equal panels
+    # middle row: centered regime legend
+    # bottom row: 4 equal panels
+    # -----------------------------
+    fig = plt.figure(figsize=(18.8, 9.2), dpi=dpi)
+    outer = fig.add_gridspec(
+        3, 1,
+        height_ratios=[1.0, 0.13, 1.0],
+        hspace=0.12
+    )
+
+    gs_top = outer[0].subgridspec(1, 3, wspace=0.25)
+    gs_bot = outer[2].subgridspec(1, 4, wspace=0.25)
+
+    # -----------------------------
+    # top row
+    # -----------------------------
+    ax_true = fig.add_subplot(gs_top[0, 0])
+    for k in range(K):
+        m = (true_reg == k)
+        if np.any(m):
+            ax_true.scatter(
+                coords_std[m, 0], coords_std[m, 1],
+                s=s_map, alpha=a_map, color=colors[k],
+                linewidths=0, rasterized=True
+            )
+    ax_true.set_title("True regimes", fontweight="bold", pad=10)
+    _paper_map_axes(ax_true)
+
+    ax_pred = fig.add_subplot(gs_top[0, 1])
+    for k in range(K):
+        m = (pred_reg == k)
+        if np.any(m):
+            ax_pred.scatter(
+                coords_std[m, 0], coords_std[m, 1],
+                s=s_map, alpha=a_map, color=colors[k],
+                linewidths=0, rasterized=True
+            )
+    ax_pred.set_title("Predicted regimes", fontweight="bold", pad=10)
+    _paper_map_axes(ax_pred)
+
+    ax_unc = fig.add_subplot(gs_top[0, 2])
+    ord_unc = np.argsort(np.clip(unc01, 0, 1))
+    sc_unc = ax_unc.scatter(
+        coords_std[ord_unc, 0], coords_std[ord_unc, 1],
+        c=np.clip(unc01[ord_unc], 0, 1),
+        s=s_map, alpha=a_map, rasterized=True,
+        cmap=cmap_unc, vmin=0, vmax=1,
+        linewidths=0
+    )
+    ax_unc.set_title("Gating uncertainty (normalized entropy)", fontweight="bold", pad=10)
+    _paper_map_axes(ax_unc)
+    _add_cbar_right(ax_unc, sc_unc, "H(p) (0–1)")
+
+    # -----------------------------
+    # legend row
+    # -----------------------------
+    ax_leg = fig.add_subplot(outer[1])
+    ax_leg.axis("off")
+    handles = [Patch(facecolor=colors[k], edgecolor="none", label=str(k + lab_off)) for k in range(K)]
+    ax_leg.legend(
+        handles=handles,
+        title="Regime",
+        loc="center",
+        ncol=min(K, 8),
+        frameon=False,
+        handlelength=1.0,
+        columnspacing=1.2
+    )
+
+    # -----------------------------
+    # bottom row
+    # -----------------------------
+    def _panel(ax, vals, title, cblab):
+        vals = np.asarray(vals).ravel()
+        ord_ = np.argsort(vals)
+        sc = ax.scatter(
+            coords_std[ord_, 0], coords_std[ord_, 1],
+            c=vals[ord_],
+            s=s_map, alpha=a_map, rasterized=True,
+            cmap=cmap_div, vmin=vmin_all, vmax=vmax_all,
+            linewidths=0
+        )
+        ax.set_title(title, fontweight="bold", pad=10)
+        _paper_map_axes(ax)
+        _add_cbar_right(ax, sc, cblab)
+
+    ax_y = fig.add_subplot(gs_bot[0, 0])
+    _panel(ax_y, y_std, "Observed outcome y", "y")
+
+    ax_F = fig.add_subplot(gs_bot[0, 1])
+    _panel(ax_F, F_pred_std, "Predicted free energy F", "F")
+
+    ax_E = fig.add_subplot(gs_bot[0, 2])
+    _panel(ax_E, E_pred_std, "Predicted burden E", "E")
+
+    ax_S = fig.add_subplot(gs_bot[0, 3])
+    _panel(ax_S, S_pred_std, "Predicted capacity S", "S")
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+
+
+
+import matplotlib.patches as mpatches
+
+def fig_B_yx_scatter_panel(y_std, X_std, regimes, cfg, out_path, var_names=None, show_trends=False):
+    y_std = np.asarray(y_std).ravel()
+    X_std = np.asarray(X_std)
+    regimes = np.asarray(regimes).astype(int)
+
+    n, d = X_std.shape
+    if var_names is None:
+        var_names = [f"x{j+1}" for j in range(d)]
+
+
+    s = float(max(getattr(cfg, "SCATTER_S", 12.0), 18.0))
+    a = float(getattr(cfg, "SCATTER_ALPHA", 0.60))
+    lab_off = int(getattr(cfg, "REGIME_LABEL_OFFSET", 1))
+
+    K = int(np.max(regimes) + 1)
+    colors = _get_regime_colors(K)
+
+    cols = min(d, 5)
+    fig, axes = plt.subplots(1, cols, figsize=(3.9 * cols, 4.2), dpi=cfg.dpi)
+    if cols == 1:
+        axes = [axes]
+
+    for j, ax in enumerate(axes):
+        xj = X_std[:, j]
+        for k in range(K):
+            m = (regimes == k)
+            if np.any(m):
+                ax.scatter(xj[m], y_std[m], s=s, alpha=a, color=colors[k],
+                           linewidths=0, rasterized=True)
+
+        if show_trends:
+            centers, means = _binned_mean(xj, y_std, nbins=25)
+            ax.plot(centers, means, lw=2.0, color="k", alpha=0.85)
+
+        ax.set_title(f"y vs {var_names[j]}", fontweight="bold")
+        ax.set_xlabel(var_names[j])
+        if j == 0:
+            ax.set_ylabel("y")
+        ax.set_axisbelow(True)
+        ax.grid(True, linewidth=0.7, alpha=0.18)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    handles = [mpatches.Patch(color=colors[k], label=str(k + lab_off)) for k in range(K)]
+    fig.legend(handles=handles, title="Regime", loc="lower center", ncol=min(K, 8),
+               frameon=False, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def _binned_mean(x, y, nbins=25):
+    x = np.asarray(x); y = np.asarray(y)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]; y = y[ok]
+    if len(x) < max(60, nbins * 3):
+        nbins = max(10, len(x) // 12)
+
+    qs = np.linspace(0, 1, nbins + 1)
+    edges = np.quantile(x, qs)
+    edges = np.unique(edges)
+    if len(edges) < 6:
+        edges = np.linspace(np.min(x), np.max(x), nbins + 1)
+
+    centers, means = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (x >= a) & (x <= b)
+        if m.sum() < 10:
+            continue
+        centers.append(0.5 * (a + b))
+        means.append(float(np.mean(y[m])))
+    return np.array(centers), np.array(means)
+
+
+def fig_C_true_vs_pred_FES(coords_std,
+                           F_true_std, E_true_std, S_true_std,
+                           F_pred_std, E_pred_std, S_pred_std,
+                           cfg, out_path):
+    coords_std = np.asarray(coords_std)
+    cmap = _get_diverging_cmap(getattr(cfg, "CMAP_DIVERGE", "RdBu_r"))
+
+    s_map = float(max(getattr(cfg, "MAP_S", 10.0), 14.0))
+    a_map = float(getattr(cfg, "MAP_ALPHA", 0.60))
+
+    fig = plt.figure(figsize=(18, 9), dpi=cfg.dpi)
+    gs = fig.add_gridspec(2, 3, wspace=0.22, hspace=0.22)
+
+    cols = [
+        ("Free energy F", np.asarray(F_true_std), np.asarray(F_pred_std), "F"),
+        ("Burden E",      np.asarray(E_true_std), np.asarray(E_pred_std), "E"),
+        ("Capacity S",    np.asarray(S_true_std), np.asarray(S_pred_std), "S"),
+    ]
+
+    for c, (name, t, p, lab) in enumerate(cols):
+        vmin, vmax = _map_symm_vlim(np.concatenate([t.ravel(), p.ravel()]), q=98, floor=1.0)
+
+        axT = fig.add_subplot(gs[0, c])
+        scT = axT.scatter(coords_std[:, 0], coords_std[:, 1], c=t, s=s_map, alpha=a_map,
+                          cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0, rasterized=True)
+        axT.set_title(f"True {name}", fontweight="bold")
+        _paper_map_axes(axT)
+        _add_cbar_right(axT, scT, lab)
+
+        axP = fig.add_subplot(gs[1, c])
+        scP = axP.scatter(coords_std[:, 0], coords_std[:, 1], c=p, s=s_map, alpha=a_map,
+                          cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0, rasterized=True)
+        axP.set_title(f"Predicted {name}", fontweight="bold")
+        _paper_map_axes(axP)
+        _add_cbar_right(axP, scP, lab)
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_D_thermo_diagnostics(dF_true, dF_zen, dE_zen, dS_zen, var_names, cfg, out_path):
+    from matplotlib.colors import Normalize
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    dF_true = np.asarray(dF_true, float)
+    dF_zen  = np.asarray(dF_zen,  float)
+    dE_zen  = np.asarray(dE_zen,  float)
+    dS_zen  = np.asarray(dS_zen,  float)
+
+    # Global importance (median |dF/dx|)
+    I_true = np.nanmedian(np.abs(dF_true), axis=0)
+    I_zen  = np.nanmedian(np.abs(dF_zen),  axis=0)
+
+    # Burden dominance color (same as before; used in other panels)
+    I_E = np.nanmedian(np.abs(dE_zen), axis=0)
+    I_S = np.nanmedian(np.abs(dS_zen), axis=0)
+    D_E = (I_E / (I_E + I_S + 1e-12)).clip(0, 1)
+
+    # role reversal index (use Zentropy dF/dx)
+    rr = []
+    for j in range(dF_zen.shape[1]):
+        g = np.nanmedian(dF_zen[:, j])
+        sgn_g = 1.0 if g >= 0 else -1.0
+        sgn_loc = np.where(np.isnan(dF_zen[:, j]), np.nan, np.sign(dF_zen[:, j]))
+        valid = np.isfinite(sgn_loc)
+        rr.append(np.mean(sgn_loc[valid] != sgn_g) if valid.sum() else np.nan)
+    rr = np.array(rr)
+
+    cmap_div = _get_diverging_cmap(cfg.CMAP_DIVERGE)
+    norm01 = Normalize(0, 1)
+
+    fig = plt.figure(figsize=(16, 10), dpi=cfg.dpi)
+    gs = fig.add_gridspec(2, 2, wspace=0.28, hspace=0.30)
+
+    # ============================================================
+    # (1) Global importance: True vs Zentropy  [UPDATED to match Fig_F]
+    #   - scale 0~1 separately (True/max(True), Zentropy/max(Zentropy))
+    #   - sort by True (descending)
+    #   - use 2 colors (no D_E colormap here)
+    # ============================================================
+    axA = fig.add_subplot(gs[0, 0])
+
+    def _norm01_vec(a):
+        a = np.asarray(a, float)
+        mx = np.nanmax(a)
+        return a / mx if (np.isfinite(mx) and mx > 0) else a
+
+    I_true_n = _norm01_vec(I_true)
+    I_zen_n  = _norm01_vec(I_zen)
+
+    order = np.argsort(I_true_n)[::-1]
+    y = np.arange(len(order))
+    h = 0.38
+
+    axA.barh(y - h/2, I_true_n[order], height=h, label="True")
+    axA.barh(y + h/2, I_zen_n[order],  height=h, label="Zentropy")
+
+    axA.set_yticks(y)
+    axA.set_yticklabels([var_names[i] for i in order])
+    axA.invert_yaxis()
+    axA.set_xlabel("Global importance (scaled)")
+    axA.set_title("Global importance comparison")
+    axA.legend(frameon=False, loc="lower right")
+    _paper_ax(axA, grid=False)
+
+    # (2) Mechanism phase space (unchanged)
+    axB = fig.add_subplot(gs[0, 1])
+    sizes = 200 + 1800 * (I_zen / (np.nanmax(I_zen) + 1e-12))
+    sc = axB.scatter(I_E, I_S, s=sizes, c=D_E, cmap=cmap_div, norm=norm01,
+                     alpha=0.9, edgecolor="k", linewidth=0.4)
+    mx = max(np.nanmax(I_E), np.nanmax(I_S))
+    axB.plot([0, mx], [0, mx], "--", color="gray", alpha=0.6)
+    axB.set_xlabel(r"I_E (burden)")
+    axB.set_ylabel(r"I_S (capacity)")
+    axB.set_title("Mechanism phase space")
+    _paper_ax(axB, grid=True, alpha=0.22)
+    cbar = fig.colorbar(sc, ax=axB, fraction=0.046, pad=0.04)
+    cbar.set_label(r"Burden dominance $D_E$")
+
+    # (3) Spatial role heterogeneity (unchanged)
+    axC = fig.add_subplot(gs[1, 0])
+    axC.axvspan(0.0, 0.25, alpha=0.08)
+    axC.axvspan(0.50, 1.00, alpha=0.08)
+    axC.scatter(rr, I_zen, s=90, color="gray", edgecolor="k", linewidth=0.3, alpha=0.9)
+    for j, name in enumerate(var_names):
+        axC.text(rr[j] + 0.01, I_zen[j] + 0.01 * (np.nanmax(I_zen) + 1e-12), name, fontsize=10)
+    axC.set_xlim(0, 1)
+    axC.set_xlabel("Role reversal index (sign flip rate)")
+    axC.set_ylabel(r"I_F (importance, Zentropy)")
+    axC.set_title("Spatial role heterogeneity")
+    _paper_ax(axC, grid=True, alpha=0.22)
+
+    # (4) Local sensitivity distributions (Zentropy) (unchanged)
+    axD = fig.add_subplot(gs[1, 1])
+    data = [dF_zen[:, j][np.isfinite(dF_zen[:, j])] for j in range(dF_zen.shape[1])]
+    parts = axD.violinplot(data, vert=False, showmeans=False, showmedians=True, showextrema=False)
+    for pc in parts["bodies"]:
+        pc.set_alpha(0.75)
+    parts["cmedians"].set_color("k")
+    axD.axvline(0, color="k", linewidth=1, alpha=0.7)
+    axD.set_yticks(np.arange(1, len(var_names) + 1))
+    axD.set_yticklabels(var_names)
+    axD.set_xlabel(r"dF/dx")
+    axD.set_title("Local sensitivity distributions (Zentropy)")
+    _paper_ax(axD, grid=True, alpha=0.22)
+
+    fig.suptitle("Thermodynamic diagnostics", fontsize=18, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.96])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_E_sweep_k_curve(df_any, cfg, out_path):
+    df = df_any.copy()
+    if "k" in df.columns and "graph_k" not in df.columns:
+        df = df.rename(columns={"k": "graph_k"})
+    if "moran_mean" in df.columns and "moranI_mean" not in df.columns:
+        df = df.rename(columns={"moran_mean": "moranI_mean"})
+    if "r2" in df.columns and "r2_mean" not in df.columns:
+        df["r2_mean"] = df["r2"]
+
+    if "lam_entropy" in df.columns or "z_K" in df.columns:
+        df = (df.sort_values(["graph_k", "r2_mean", "moranI_mean"], ascending=[True, False, True])
+                .groupby("graph_k", as_index=False)
+                .first())
+
+    df = df.sort_values("graph_k")
+    ks = df["graph_k"].astype(int).values
+    r2m = df["r2_mean"].astype(float).values
+    r2se = df["r2_se"].astype(float).values if "r2_se" in df.columns else np.zeros_like(r2m)
+    mi = df["moranI_mean"].astype(float).values if "moranI_mean" in df.columns else np.full_like(r2m, np.nan)
+
+    fig, ax1 = plt.subplots(figsize=(7.2, 3.8), dpi=cfg.dpi)
+    ax1.errorbar(ks, r2m, yerr=r2se, marker="o")
+    ax1.set_xlabel("k (graph neighbors)")
+    ax1.set_ylabel("CV R² (mean ± SE)")
+    ax1.set_title("Zentropy: k sweep (Spatial Block CV)")
+    _paper_ax(ax1, grid=True, alpha=0.22)
+
+    ax2 = ax1.twinx()
+    ax2.plot(ks, mi, marker="s", linestyle="--")
+    ax2.set_ylabel("Held-out residual Moran's I")
+
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_E_sweep_lambda_heatmaps(df_lam, cfg, out_path):
+    """Visualize exactly the current full-grid search parameters.
+
+    Input is the CURRENT selection table with columns:
+    graph_k, K_upper, lam_sparse, lam_mag, r2_mean.
+    This visualizes the empirical CV grid; it does not change training.
+    """
+    required = {"graph_k", "K_upper", "lam_sparse", "lam_mag", "r2_mean"}
+    missing = required.difference(df_lam.columns)
+    if missing:
+        raise ValueError(f"Lambda plot input missing current-grid columns: {sorted(missing)}")
+    df = df_lam.loc[(df_lam["graph_k"] == cfg.graph_k) &
+                    (df_lam["K_upper"] == cfg.K_UPPER)].copy()
+    if df.empty:
+        raise ValueError(f"No lambda-sweep rows for graph_k={cfg.graph_k}, K_upper={cfg.K_UPPER}")
+
+    lams_sparse = sorted(df["lam_sparse"].unique())
+    lams_mag = sorted(df["lam_mag"].unique())
+    mat = np.full((len(lams_sparse), len(lams_mag)), np.nan, dtype=float)
+    for ri, ls in enumerate(lams_sparse):
+        for ci, lm in enumerate(lams_mag):
+            candidates = df.loc[(df["lam_sparse"] == ls) & (df["lam_mag"] == lm), "r2_mean"]
+            if len(candidates):
+                mat[ri, ci] = float(candidates.max())
+    if not np.isfinite(mat).any():
+        raise ValueError("Lambda sweep contained no finite CV R² values")
+    low, high = float(np.nanmin(mat)), float(np.nanmax(mat))
+    if high - low < 1e-12:
+        high = low + 1e-6
+
+    fig, ax = plt.subplots(figsize=(max(5.4, 1.4 + 1.2 * len(lams_mag)),
+                                    max(4.0, 1.8 + 0.7 * len(lams_sparse))), dpi=cfg.dpi)
+    im = ax.imshow(mat, cmap=_get_sequential_cmap(getattr(cfg, "CMAP_SEQ", "cividis")),
+                   vmin=low, vmax=high, origin="lower", aspect="auto")
+    ax.set_xticks(np.arange(len(lams_mag)), [f"{v:g}" for v in lams_mag])
+    ax.set_yticks(np.arange(len(lams_sparse)), [f"{v:g}" for v in lams_sparse])
+    ax.set_xlabel(r"$\lambda_{mag}$")
+    ax.set_ylabel(r"$\lambda_{sparse}$")
+    ax.set_title(f"Spatial block CV at k={cfg.graph_k}, K={cfg.K_UPPER}")
+    for ri in range(mat.shape[0]):
+        for ci in range(mat.shape[1]):
+            if np.isfinite(mat[ri, ci]):
+                mid = (low + high) / 2
+                ax.text(ci, ri, f"{mat[ri,ci]:.3f}", ha="center", va="center",
+                        color="white" if mat[ri,ci] > mid else "black")
+    fig.colorbar(im, ax=ax, fraction=0.048, pad=0.04, label=r"Block-CV mean $R^2$")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def fig_F_cv_benchmark(cv_long, cfg: CFG, out_path):
+    df0 = cv_long.copy()
+    cols = set(df0.columns)
+
+    # allow cv_summary input
+    if "r2_mean" in cols and "rmse_mean" in cols:
+        df = df0.copy()
+        if "r2_std" not in df.columns: df["r2_std"] = 0.0
+        if "rmse_std" not in df.columns: df["rmse_std"] = 0.0
+    else:
+        # fold-level long -> aggregate
+        need = {"cv_type","model","r2","rmse"}
+        if not need.issubset(cols):
+            _safe_save_error_figure(out_path, "fig_F_cv_benchmark", f"Missing columns: {sorted(list(need-cols))}")
+            return
+        df = df0.groupby(["cv_type","model"], as_index=False).agg(
+            r2_mean=("r2","mean"), r2_std=("r2","std"),
+            rmse_mean=("rmse","mean"), rmse_std=("rmse","std")
+        )
+        df["r2_std"] = df["r2_std"].fillna(0.0)
+        df["rmse_std"] = df["rmse_std"].fillna(0.0)
+
+    model_order = ["OLS", "GWR", "DT", "RF", "GBR", "DNN", "GNN", "Zentropy"]
+    df["model"] = pd.Categorical(df["model"], categories=model_order, ordered=True)
+    df = df.sort_values(["cv_type", "model"])
+
+    cv_types = list(df["cv_type"].unique())
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.2), dpi=cfg.dpi)
+
+    ax = axes[0]
+    for cvt in cv_types:
+        sub = df[df["cv_type"] == cvt].copy()
+        x = np.arange(len(sub))
+        ax.errorbar(x, sub["r2_mean"], yerr=sub["r2_std"], marker="o", linestyle="-", label=str(cvt), capsize=3)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(s) for s in sub["model"]], rotation=25, ha="right")
+    ax.set_ylabel("R²")
+    ax.set_title("Cross-validation R² (all models)")
+    _paper_ax(ax, grid=True, alpha=0.22)
+    ax.legend(frameon=False)
+
+    ax = axes[1]
+    for cvt in cv_types:
+        sub = df[df["cv_type"] == cvt].copy()
+        x = np.arange(len(sub))
+        ax.errorbar(x, sub["rmse_mean"], yerr=sub["rmse_std"], marker="o", linestyle="-", label=str(cvt), capsize=3)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(s) for s in sub["model"]], rotation=25, ha="right")
+    ax.set_ylabel("RMSE")
+    ax.set_title("Cross-validation RMSE (all models)")
+    _paper_ax(ax, grid=True, alpha=0.22)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_F_validation_importance_2x2(df_cv, dF_true, dF_zen, var_names, cfg, out_path):
+    """
+    [UPDATED] Validation figure: keep ONLY global importance comparison.
+    - Drops CV metric panels and local sensitivity violin panel (per discussion).
+    - Still accepts the same signature for compatibility with main().
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    dF_true = np.asarray(dF_true, float)
+    dF_zen  = np.asarray(dF_zen,  float)
+    var_names = list(var_names)
+
+    # Global importance = median |dF/dx|
+    I_true = np.nanmedian(np.abs(dF_true), axis=0)
+    I_zen  = np.nanmedian(np.abs(dF_zen),  axis=0)
+
+    # Normalize to 0-1 for side-by-side comparability
+    def _norm01(a):
+        a = np.asarray(a, float)
+        mx = np.nanmax(a)
+        return a / mx if (np.isfinite(mx) and mx > 0) else a
+
+    I_true_n = _norm01(I_true)
+    I_zen_n  = _norm01(I_zen)
+
+    # Sort by True importance (descending)
+    order = np.argsort(I_true_n)[::-1]
+    names_ord = [var_names[i] for i in order]
+    t = I_true_n[order]
+    z = I_zen_n[order]
+
+    fig, ax = plt.subplots(figsize=(8.6, 5.0), dpi=cfg.dpi)
+    y = np.arange(len(names_ord))
+    h = 0.38
+    ax.barh(y - h/2, t, height=h, label="True")
+    ax.barh(y + h/2, z, height=h, label="Zentropy")
+    ax.set_yticks(y)
+    ax.set_yticklabels(names_ord)
+    ax.invert_yaxis()
+    ax.set_xlabel("Global importance (scaled)")
+    ax.set_title("Global importance comparison", fontweight="bold")
+    ax.legend(frameon=False, loc="lower right")
+    _paper_ax(ax, grid=False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def fig_G_residual_diagnostics(coords_std, y_std, preds_dict, out_path, cfg):
+    models = list(preds_dict.keys())
+    resid_by_model = {}
+    I_vals, p_vals = [], []
+
+    for m in models:
+        resid = y_std - preds_dict[m]
+        resid_by_model[m] = resid
+        I, p = moran_residuals(resid, coords_std, k=cfg.moran_knn)
+        I_vals.append(I); p_vals.append(p)
+
+    all_r = np.concatenate([r.ravel() for r in resid_by_model.values()])
+    v = np.nanpercentile(np.abs(all_r), 98)
+    v = float(v) if np.isfinite(v) and v > 0 else 1.0
+
+    fig = plt.figure(figsize=(18, 8.6), dpi=cfg.dpi)
+    gs = fig.add_gridspec(2, 5, width_ratios=[1,1,1,1,0.06], wspace=0.18, hspace=0.25)
+
+    cmap = _get_diverging_cmap(cfg.CMAP_DIVERGE)
+
+    sc_last = None
+    for idx, m in enumerate(models[:8]):  # 2x4
+        r = idx // 4
+        c = idx % 4
+        ax = fig.add_subplot(gs[r, c])
+
+        sc = ax.scatter(
+            coords_std[:, 0], coords_std[:, 1],
+            c=resid_by_model[m], s=cfg.MAP_S,
+            cmap=cmap, vmin=-v, vmax=v,
+            linewidths=0, rasterized=True
+        )
+        sc_last = sc
+
+        I = I_vals[idx]; p = p_vals[idx]
+        I_txt = f"{I:.2f}" if np.isfinite(I) else "NA"
+        p_txt = f"{p:.3f}" if np.isfinite(p) else "NA"
+        ax.set_title(f"{m}\n(I={I_txt}, p={p_txt})", fontsize=10, fontweight="bold")
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.axis("off")
+
+    cax = fig.add_subplot(gs[:, 4])
+    cb = fig.colorbar(sc_last, cax=cax)
+    cb.set_label("Residuals")
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return pd.DataFrame({"model": models, "I": I_vals, "p": p_vals})
+
+
+
+
+from matplotlib.colors import Normalize
+
+def fig_H2_sensitivity_maps_true_zentropy_fes_vs_gwr(
+    coords_xy,
+    true_dYdx,
+    z_dFdx,
+    z_dEdx,
+    z_dSdx,
+    gwr_beta,
+    cfg,
+    out_path=None,
+    var_names=None,
+
+    point_scale=0.40,
+    alpha=0.95,
+    cmap="RdBu_r",
+    vlim_q=97.0,
+    vlim_floor=0.6,
+    coords_rescale="square_unit",
+    axis_pad_frac=0.02,
+    force_single_right_colorbar=True,
+
+    out_png=None
+):
+    import numpy as np
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+
+    if out_path is None:
+        out_path = out_png
+    if out_path is None:
+        raise ValueError("out_path (or out_png) must be provided.")
+
+    coords_xy = np.asarray(coords_xy, dtype=float)
+    n = coords_xy.shape[0]
+
+    arrs = [true_dYdx, z_dFdx, z_dEdx, z_dSdx, gwr_beta]
+    arrs = [np.asarray(a, dtype=float) for a in arrs]
+
+    p = arrs[0].shape[1]
+    for a in arrs:
+        if a.shape != (n, p):
+            raise ValueError(f"All arrays must have shape (N, p). Got {a.shape} expected {(n, p)}")
+
+    if var_names is None:
+        var_names = [f"x{i+1}" for i in range(p)]
+    if len(var_names) != p:
+        raise ValueError("var_names length must match p")
+
+    coords_plot = coords_xy.copy()
+    if coords_rescale == "square_unit":
+        cx = float(np.nanmean(coords_plot[:, 0]))
+        cy = float(np.nanmean(coords_plot[:, 1]))
+        span_x = float(np.nanmax(coords_plot[:, 0]) - np.nanmin(coords_plot[:, 0]))
+        span_y = float(np.nanmax(coords_plot[:, 1]) - np.nanmin(coords_plot[:, 1]))
+        span = max(span_x, span_y)
+        if not np.isfinite(span) or span <= 0:
+            span = 1.0
+        coords_plot[:, 0] = (coords_plot[:, 0] - cx) / span
+        coords_plot[:, 1] = (coords_plot[:, 1] - cy) / span
+
+    xmin, xmax = float(np.min(coords_plot[:, 0])), float(np.max(coords_plot[:, 0]))
+    ymin, ymax = float(np.min(coords_plot[:, 1])), float(np.max(coords_plot[:, 1]))
+    span = max(xmax - xmin, ymax - ymin)
+    pad = axis_pad_frac * (span if span > 0 else 1.0)
+    xlim = (xmin - pad, xmax + pad)
+    ylim = (ymin - pad, ymax + pad)
+
+    base_s = float(getattr(cfg, "SCATTER_S", 14.0))
+    s = max(1.0, base_s * float(point_scale))
+
+    all_vals = np.concatenate([a.reshape(-1) for a in arrs], axis=0)
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if all_vals.size == 0:
+        vmax = 1.0
+    else:
+        vmax = float(np.nanpercentile(np.abs(all_vals), vlim_q))
+        if (not np.isfinite(vmax)) or vmax <= 0:
+            vmax = 1.0
+    vmax = max(vmax, float(vlim_floor))
+
+    norm = mpl.colors.Normalize(vmin=-vmax, vmax=vmax)
+    cmap_obj = mpl.colormaps.get_cmap(cmap) if hasattr(mpl, "colormaps") else plt.get_cmap(cmap)
+
+    row_labels = ["True dy/dx", "Zentropy dF/dx", "Zentropy dE/dx", "Zentropy dS/dx", "GWR coeff"]
+
+    fig, axes = plt.subplots(
+        nrows=5, ncols=p,
+        figsize=(3.0 * p, 2.25 * 5),
+        constrained_layout=False
+    )
+
+    for r in range(5):
+        for j in range(p):
+            ax = axes[r, j]
+            v = arrs[r][:, j]
+            ax.scatter(
+                coords_plot[:, 0], coords_plot[:, 1],
+                c=v, s=s, cmap=cmap_obj, norm=norm,
+                linewidths=0.0, alpha=float(alpha),
+                rasterized=True
+            )
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+            ax.set_aspect("equal", adjustable="box")
+            for sp in ax.spines.values():
+                sp.set_linewidth(1.0); sp.set_alpha(0.35)
+            if r == 0:
+                ax.set_title(str(var_names[j]), fontsize=16, fontweight="bold", pad=10)
+
+    for r, lab in enumerate(row_labels):
+        axes[r, 0].set_ylabel(lab, fontsize=14, fontweight="bold", rotation=90, labelpad=24)
+
+    fig.subplots_adjust(left=0.06, right=0.90, top=0.92, bottom=0.06, wspace=0.10, hspace=0.18)
+
+    if force_single_right_colorbar:
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+        sm.set_array([])
+        cax = fig.add_axes([0.92, 0.11, 0.018, 0.80])
+        cb = fig.colorbar(sm, cax=cax)
+        cb.set_label("value", fontsize=12)
+        cb.ax.tick_params(labelsize=10)
+
+    dpi = int(getattr(cfg, "dpi", 300))
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def fig_2_simulation_composite(cfg,
+                               path_A, path_B, path_C, path_D, path_E,
+                               cv_summary,
+                               out_path):
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    def _read_img(p):
+        if (p is None) or (not os.path.exists(p)):
+            return None
+        return mpimg.imread(p)
+
+    imgA = _read_img(path_A)
+    imgB = _read_img(path_B)
+    imgC = _read_img(path_C)
+    imgD = _read_img(path_D)
+    imgE = _read_img(path_E)
+
+    fig = plt.figure(figsize=(19.5, 12.0), dpi=cfg.dpi, facecolor="black")
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.05, 1.0], wspace=0.03)
+
+    gsL = outer[0].subgridspec(3, 1, height_ratios=[0.28, 0.55, 0.60], hspace=0.04)
+    gsR = outer[1].subgridspec(3, 1, height_ratios=[0.62, 0.28, 0.10], hspace=0.04)
+
+    def _panel_img(subspec, img, label):
+        ax = fig.add_subplot(subspec)
+        ax.set_facecolor("black")
+        ax.axis("off")
+        if img is None:
+            ax.text(0.5, 0.5, f"Missing panel {label}", ha="center", va="center", color="white", fontsize=14)
+        else:
+            ax.imshow(img)
+        ax.text(0.01, 0.99, label, transform=ax.transAxes,
+                ha="left", va="top", fontsize=16, fontweight="bold",
+                color="white", bbox=dict(facecolor="black", edgecolor="none", pad=4))
+        return ax
+
+    _panel_img(gsL[0], imgA, "A")
+    _panel_img(gsL[1], imgB, "B")
+    _panel_img(gsL[2], imgC, "C")
+    _panel_img(gsR[0], imgD, "D")
+    _panel_img(gsR[1], imgE, "E")
+
+    # --- F: CV curves drawn directly (no standalone Fig_F) ---
+    gsF = gsR[2].subgridspec(1, 2, wspace=0.35)
+    axF1 = fig.add_subplot(gsF[0, 0])
+    axF2 = fig.add_subplot(gsF[0, 1])
+    for ax in (axF1, axF2):
+        ax.set_facecolor("white")
+
+    # Put "F" label on the left subplot
+    axF1.text(-0.18, 1.15, "F", transform=axF1.transAxes,
+              ha="left", va="top", fontsize=16, fontweight="bold",
+              color="white", bbox=dict(facecolor="black", edgecolor="none", pad=4))
+
+    df = cv_summary.copy()
+    model_order = ["OLS", "GWR", "DT", "RF", "GBR", "DNN", "GNN", "Zentropy"]
+    df["model"] = pd.Categorical(df["model"], categories=model_order, ordered=True)
+    df = df.sort_values(["cv_type", "model"])
+
+    cv_types = list(df["cv_type"].unique())
+    x = np.arange(len(model_order))
+
+    # R2
+    for cvt in cv_types:
+        sub = df[df["cv_type"] == cvt].set_index("model").reindex(model_order)
+        axF1.errorbar(x, sub["r2_mean"].values,
+                      yerr=sub["r2_std"].values, marker="o", linestyle="-",
+                      label=str(cvt), capsize=3)
+    axF1.set_xticks(x)
+    axF1.set_xticklabels(model_order, rotation=25, ha="right")
+    axF1.set_ylabel("R²")
+    axF1.set_title("Cross-validation R² (all models)")
+    _paper_ax(axF1, grid=True, alpha=0.22)
+    axF1.legend(frameon=False)
+
+    # RMSE
+    for cvt in cv_types:
+        sub = df[df["cv_type"] == cvt].set_index("model").reindex(model_order)
+        axF2.errorbar(x, sub["rmse_mean"].values,
+                      yerr=sub["rmse_std"].values, marker="o", linestyle="-",
+                      label=str(cvt), capsize=3)
+    axF2.set_xticks(x)
+    axF2.set_xticklabels(model_order, rotation=25, ha="right")
+    axF2.set_ylabel("RMSE")
+    axF2.set_title("Cross-validation RMSE (all models)")
+    _paper_ax(axF2, grid=True, alpha=0.22)
+    axF2.legend(frameon=False)
+
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+def fig_I_simulation_composite(cfg, path_A, path_B, path_C, path_D, path_E, path_F, out_path):
+    import os
+    import matplotlib.pyplot as plt
+    import matplotlib.image as mpimg
+
+    def _put(ax, path, title):
+        ax.axis("off")
+        ax.set_title(title, fontweight="bold", loc="left")
+        if (path is not None) and os.path.exists(path):
+            ax.imshow(mpimg.imread(path))
+        else:
+            ax.text(0.5, 0.5, f"Missing:\n{path}", ha="center", va="center")
+
+    fig = plt.figure(figsize=(18, 11), dpi=cfg.dpi)
+    gs = fig.add_gridspec(3, 2, wspace=0.06, hspace=0.12)
+
+    axA = fig.add_subplot(gs[0, 0]); _put(axA, path_A, "A")
+    axD = fig.add_subplot(gs[0, 1]); _put(axD, path_D, "D")
+
+    axB = fig.add_subplot(gs[1, 0]); _put(axB, path_B, "B")
+    axE = fig.add_subplot(gs[1, 1]); _put(axE, path_E, "E")
+
+    axC = fig.add_subplot(gs[2, 0]); _put(axC, path_C, "C")
+    axF = fig.add_subplot(gs[2, 1]); _put(axF, path_F, "F")
+
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+# ==============================================================================
+# 6) EVALUATION / CV / SWEEP
+# ==============================================================================
+def fit_baselines_in_sample(data, edges_full, cfg: CFG, gwr_bw):
+    # in-sample uses globally standardized data for clean figures
+    X = data["X_std"]; y = data["y_std"]; coords = data["coords_std"]
+    preds = {}
+
+    preds["OLS"] = sm.OLS(y, sm.add_constant(X)).fit().predict(sm.add_constant(X))
+    preds["DT"] = DecisionTreeRegressor(max_depth=8, random_state=cfg.seed).fit(X, y).predict(X)
+    preds["RF"] = RandomForestRegressor(n_estimators=200, max_depth=12, random_state=cfg.seed).fit(X, y).predict(X)
+    preds["GBR"] = GradientBoostingRegressor(n_estimators=200, max_depth=3, random_state=cfg.seed).fit(X, y).predict(X)
+
+    gwr = FastGWR(coords, X, y, gwr_bw)
+    preds["GWR"], gwr_coeffs = gwr.predict(coords, X, return_coeffs=True)
+
+    # torch
+    mask_all = np.ones(len(y), dtype=bool)
+    data_dict = {"X": X, "y": y, "coords": coords}
+    yhat_dnn, model_dnn = train_torch(None, data_dict, mask_all, edges_full, cfg, model_name="DNN")
+    preds["DNN"] = yhat_dnn
+
+    yhat_gnn, model_gnn = train_torch(None, data_dict, mask_all, edges_full, cfg, model_name="GNN")
+    preds["GNN"] = yhat_gnn
+
+    yhat_z, model_z = train_torch(None, data_dict, mask_all, edges_full, cfg, model_name="Zentropy")
+    preds["Zentropy"] = yhat_z
+
+    return preds, gwr, gwr_coeffs, model_dnn, model_gnn, model_z
+
+
+def _fold_scaled_data(X_raw, y_raw, coords_std, tr_idx, te_idx):
+    # fold-wise scaling to avoid leakage + stabilize baselines
+    xsc = StandardScaler().fit(X_raw[tr_idx])
+    ysc = StandardScaler().fit(y_raw[tr_idx].reshape(-1, 1))
+
+    X_tr = xsc.transform(X_raw[tr_idx])
+    X_te = xsc.transform(X_raw[te_idx])
+
+    y_tr = ysc.transform(y_raw[tr_idx].reshape(-1, 1)).ravel()
+    y_te = ysc.transform(y_raw[te_idx].reshape(-1, 1)).ravel()
+
+    # full arrays on standardized scale of the fold (for torch convenience)
+    X_all = np.empty_like(X_raw, dtype=float)
+    y_all = np.empty_like(y_raw, dtype=float)
+    X_all[tr_idx] = X_tr
+    X_all[te_idx] = X_te
+    y_all[tr_idx] = y_tr
+    y_all[te_idx] = y_te
+    return X_tr, y_tr, X_te, y_te, X_all, y_all
+
+
+def run_cv_all_models(data, cfg: CFG, edges_full, gwr_bw):
+    n = len(data["y_raw"])
+    X_raw = data["X_raw"]
+    y_raw = data["y_raw"]
+    coords_std = data["coords_std"]
+    blocks = _make_blocks(data["coords"], cfg.block_nx, cfg.block_ny)
+
+    kf = KFold(n_splits=cfg.cv_folds, shuffle=True, random_state=cfg.seed)
+    gkf = GroupKFold(n_splits=cfg.cv_folds)
+
+    cv_long = []
+    oof_preds_by_cv = {}
+    model_list = ["OLS", "GWR", "DT", "RF", "GBR", "DNN", "GNN", "Zentropy"]
+
+    for cv_type, splits in [
+        ("Random", kf.split(X_raw)),
+        ("Block", gkf.split(X_raw, groups=blocks)),
+    ]:
+        oof = {m: np.full(n, np.nan, dtype=float) for m in model_list}
+        fold_id = 0
+
+        for tr, te in splits:
+            fold_id += 1
+            train_mask = np.zeros(n, dtype=bool); train_mask[tr] = True
+            edges_fold = disconnect_train_test_edges(edges_full, train_mask)
+
+            X_tr, y_tr, X_te, y_te, X_all, y_all = _fold_scaled_data(X_raw, y_raw, coords_std, tr, te)
+
+            # OLS
+            ols = sm.OLS(y_tr, sm.add_constant(X_tr)).fit()
+            oof["OLS"][te] = ols.predict(sm.add_constant(X_te))
+
+            # Trees / ensembles
+            dt = DecisionTreeRegressor(max_depth=8, random_state=cfg.seed).fit(X_tr, y_tr)
+            oof["DT"][te] = dt.predict(X_te)
+
+            rf = RandomForestRegressor(n_estimators=200, max_depth=12, random_state=cfg.seed).fit(X_tr, y_tr)
+            oof["RF"][te] = rf.predict(X_te)
+
+            gbr = GradientBoostingRegressor(n_estimators=200, max_depth=3, random_state=cfg.seed).fit(X_tr, y_tr)
+            oof["GBR"][te] = gbr.predict(X_te)
+
+            # GWR (fit on train only)
+            bw = int(np.clip(gwr_bw, cfg.gwr_bw_min, len(tr) - 1))
+            gwr = FastGWR(coords_std[tr], X_tr, y_tr, bw)
+            oof["GWR"][te] = gwr.predict(coords_std[te], X_te)
+
+            # torch models trained on fold-standardized arrays
+            fold_data = {"X": X_all, "y": y_all, "coords": coords_std}
+
+            set_seed(cfg.seed + fold_id)
+            yhat_dnn, _ = train_torch(None, fold_data, train_mask, edges_full, cfg, model_name="DNN", epochs=int(cfg.epochs_final * 0.55))
+            oof["DNN"][te] = yhat_dnn[te]
+
+            set_seed(cfg.seed + 1000 + fold_id)
+            yhat_gnn, _ = train_torch(None, fold_data, train_mask, edges_fold, cfg, model_name="GNN", epochs=int(cfg.epochs_final * 0.55))
+            oof["GNN"][te] = yhat_gnn[te]
+
+            set_seed(cfg.seed + 2000 + fold_id)
+            yhat_z, _ = train_torch(None, fold_data, train_mask, edges_fold, cfg, model_name="Zentropy", epochs=int(cfg.epochs_final * 0.55))
+            oof["Zentropy"][te] = yhat_z[te]
+
+            for m in model_list:
+                r2 = float(r2_score(y_te, oof[m][te]))
+                rmse = float(math.sqrt(mean_squared_error(y_te, oof[m][te])))
+                cv_long.append({"cv_type": cv_type, "fold": fold_id, "model": m, "r2": r2, "rmse": rmse})
+
+        for m in model_list:
+            if np.any(~np.isfinite(oof[m])):
+                raise RuntimeError(f"[{cv_type}] OOF has NaNs for model={m}.")
+        oof_preds_by_cv[cv_type] = oof
+
+    return pd.DataFrame(cv_long), oof_preds_by_cv
+
+
+def _cv_stats_from_folds(rows, folds):
+    r2 = np.array([r["r2"] for r in rows], dtype=float)
+    rmse = np.array([r["rmse"] for r in rows], dtype=float)
+    mi = np.array([r.get("moranI", np.nan) for r in rows], dtype=float)
+    bic = np.array([r.get("bic", np.nan) for r in rows], dtype=float)
+    sil = np.array([r.get("silhouette", np.nan) for r in rows], dtype=float)
+
+    out = {
+        "r2_mean": float(np.nanmean(r2)),
+        "r2_std": float(np.nanstd(r2, ddof=1)) if len(r2) > 1 else 0.0,
+        "rmse_mean": float(np.nanmean(rmse)),
+        "rmse_std": float(np.nanstd(rmse, ddof=1)) if len(rmse) > 1 else 0.0,
+        "moranI_mean": float(np.nanmean(mi)),
+        "moranI_std": float(np.nanstd(mi, ddof=1)) if np.sum(np.isfinite(mi)) > 1 else 0.0,
+        "bic_mean": float(np.nanmean(bic)),
+        "bic_std": float(np.nanstd(bic, ddof=1)) if np.sum(np.isfinite(bic)) > 1 else 0.0,
+        "silhouette_mean": float(np.nanmean(sil)),
+        "silhouette_std": float(np.nanstd(sil, ddof=1)) if np.sum(np.isfinite(sil)) > 1 else 0.0,
+    }
+    out["r2_se"] = out["r2_std"] / math.sqrt(max(1, folds))
+    out["rmse_se"] = out["rmse_std"] / math.sqrt(max(1, folds))
+    out["moranI_se"] = out["moranI_std"] / math.sqrt(max(1, folds))
+    out["bic_se"] = out["bic_std"] / math.sqrt(max(1, folds))
+    out["silhouette_se"] = out["silhouette_std"] / math.sqrt(max(1, folds))
+    return out
+
+
+def eval_zentropy_block_cv(data, cfg_eval: CFG):
+    X_raw = data["X_raw"]
+    y_raw = data["y_raw"]
+    coords_std = data["coords_std"]
+    blocks = _make_blocks(data["coords"], cfg_eval.block_nx, cfg_eval.block_ny)
+    gkf = GroupKFold(n_splits=cfg_eval.cv_folds)
+
+    edges_full = make_knn_edges(coords_std, cfg_eval.graph_k)
+
+    fold_rows = []
+    fold_id = 0
+    for tr, te in gkf.split(X_raw, groups=blocks):
+        fold_id += 1
+        train_mask = np.zeros(len(y_raw), dtype=bool); train_mask[tr] = True
+        edges_fold = disconnect_train_test_edges(edges_full, train_mask)
+
+        # fold-wise scaling
+        X_tr, y_tr, X_te, y_te, X_all, y_all = _fold_scaled_data(X_raw, y_raw, coords_std, tr, te)
+        fold_data = {"X": X_all, "y": y_all, "coords": coords_std}
+
+        set_seed(cfg_eval.seed + 70000 + fold_id + 31 * cfg_eval.graph_k + 101 * cfg_eval.z_K)
+        yhat, model = train_torch(None, fold_data, train_mask, edges_fold, cfg_eval, model_name="Zentropy", epochs=160)
+
+        resid = (y_te - yhat[te])
+        r2 = float(r2_score(y_te, yhat[te]))
+        rmse = float(math.sqrt(mean_squared_error(y_te, yhat[te])))
+
+        mi, mip = moran_residuals(resid, coords_std[te], k=cfg_eval.moran_knn)
+
+        rss = float(np.sum(resid ** 2))
+        n_te = int(len(te))
+        k_params = int(sum(p.numel() for p in model.parameters()))
+        bic = float(n_te * np.log((rss / max(1, n_te)) + 1e-12) + k_params * np.log(max(2, n_te)))
+
+        sil = np.nan
+        try:
+            _yhat_all, p_all, *_ = zentropy_internals(model, fold_data, edges_fold, cfg_eval)
+            p_te = p_all[te]
+            lab = np.argmax(p_te, axis=1)
+            if (len(np.unique(lab)) >= 2) and (len(lab) > len(np.unique(lab))):
+                sil = float(silhouette_score(p_te, lab, metric="euclidean"))
+        except Exception:
+            sil = np.nan
+
+        fold_rows.append({
+            "fold": fold_id,
+            "r2": r2,
+            "rmse": rmse,
+            "moranI": float(mi),
+            "moran_p": float(mip),
+            "bic": bic,
+            "silhouette": sil
+        })
+
+    return fold_rows
+
+
+def zentropy_full_grid_search_methodology(data, cfg: CFG):
+    grid = list(itertools.product(
+        list(cfg.GRAPH_K_CANDIDATES),
+        list(cfg.LAMBDA_SPARSE_LIST),
+        list(cfg.LAMBDA_MAGNITUDE_LIST),
+    ))
+
+    rows = []
+    best_r2 = -np.inf
+    best_se = np.inf
+
+    for (gk, ls, lm) in grid:
+        tmp = deepcopy(cfg)
+        tmp.graph_k = int(gk)
+        tmp.z_K = int(cfg.K_UPPER)
+        tmp.lam_sparse = float(ls)
+        tmp.lam_mag = float(lm)
+
+        fold_rows = eval_zentropy_block_cv(data, tmp)
+        stats = _cv_stats_from_folds(fold_rows, cfg.cv_folds)
+
+        row = {
+            "graph_k": int(gk), "K_upper": int(cfg.K_UPPER),
+            "lam_sparse": float(ls), "lam_mag": float(lm),
+            "r2_mean": stats["r2_mean"], "r2_se": stats["r2_se"],
+            "rmse_mean": stats["rmse_mean"], "rmse_se": stats["rmse_se"],
+            "moranI_mean": stats.get("moranI_mean", np.nan),
+            "bic_mean": stats.get("bic_mean", np.nan),
+            "silhouette_mean": stats.get("silhouette_mean", np.nan),
+        }
+        rows.append(row)
+        if row["r2_mean"] > best_r2:
+            best_r2 = row["r2_mean"]
+            best_se = row["r2_se"]
+        print(f"[GRID] k={int(gk):2d} K_upper={int(cfg.K_UPPER)} ls={ls} lm={lm} | "
+              f"R2={row['r2_mean']:.4f}±{row['r2_se']:.4f} | RMSE={row['rmse_mean']:.4f} | "
+              f"MoranI={row['moranI_mean'] if np.isfinite(row['moranI_mean']) else np.nan:.4f}")
+
+    sweep_df = pd.DataFrame(rows)
+    thr = best_r2 - best_se
+    cand = sweep_df[sweep_df["r2_mean"] >= thr].copy()
+    if cand.empty:
+        cand = sweep_df.copy()
+
+    cand["reg_total"] = cand["lam_sparse"] + cand["lam_mag"]
+    cand["moranI_sort"] = cand["moranI_mean"].fillna(np.inf)
+    cand["bic_sort"] = cand["bic_mean"].fillna(np.inf)
+    cand["sil_sort"] = cand["silhouette_mean"].fillna(-np.inf)
+    cand = cand.sort_values(by=["graph_k", "reg_total", "moranI_sort", "bic_sort", "sil_sort"],
+                            ascending=[True, True, True, True, False])
+
+    best_row = cand.iloc[0].to_dict()
+    best_cfg = deepcopy(cfg)
+    best_cfg.graph_k = int(best_row["graph_k"])
+    best_cfg.K_UPPER = int(cfg.K_UPPER)
+    best_cfg.lam_sparse = float(best_row["lam_sparse"])
+    best_cfg.lam_mag = float(best_row["lam_mag"])
+    print(f"[GRID DONE] best_mean={best_r2:.4f}, 1SE={best_se:.4f}, threshold={thr:.4f} -> "
+          f"selected: k={best_cfg.graph_k}, K_upper={best_cfg.K_UPPER}, ls={best_cfg.lam_sparse}, lm={best_cfg.lam_mag}")
+
+    sweep_df = sweep_df.sort_values(["r2_mean", "moranI_mean"], ascending=[False, True]).reset_index(drop=True)
+    df_k = (sweep_df.sort_values(["graph_k", "r2_mean", "moranI_mean"], ascending=[True, False, True])
+                    .groupby("graph_k", as_index=False).first().rename(columns={"graph_k":"k"}))
+    df_lam = sweep_df[sweep_df["graph_k"] == best_cfg.graph_k].copy()
+    return best_cfg, sweep_df, df_k, df_lam
+
+
+# ==============================================================================
+# 7) MAIN
+
+# ==============================================================================
+# 7) MAIN
+# ==============================================================================
+def main():
+    cfg = CFG()
+    apply_paper_style(cfg)
+    set_seed(cfg.seed)
+
+    OUT = cfg.out_dir
+    DIR_DATA = os.path.join(OUT, "DATA")
+    DIR_TABLES = os.path.join(OUT, "TABLES")
+    DIR_FIG = os.path.join(OUT, "FIGURES")
+    DIR_MODELS = os.path.join(OUT, "MODELS")
+    for d in [OUT, DIR_DATA, DIR_TABLES, DIR_FIG, DIR_MODELS]:
+        ensure_dir(d)
+
+    print("============================================================")
+    print("ZENTROPY FINAL PIPELINE (SINGLE FILE, ALL FIGURES)")
+    print("============================================================")
+
+    print("\n[1/6] Generating simulation dataset...")
+    data = generate_simulation(cfg)
+    var_names = [f"x{i+1}" for i in range(cfg.p)]
+
+    # Save dataset snapshot
+    df_data = pd.DataFrame(data["X_std"], columns=var_names)
+    df_data["y_std"] = data["y_std"]
+    df_data["true_regime"] = data["regimes_true"]
+    df_data["x"] = data["coords"][:, 0]
+    df_data["y"] = data["coords"][:, 1]
+    df_data.to_csv(os.path.join(DIR_DATA, "SimData.csv"), index=False)
+    np.save(os.path.join(DIR_DATA, "True_dF.npy"), data["dF_true"])
+    np.save(os.path.join(DIR_DATA, "True_dE.npy"), data["dE_true"])
+    np.save(os.path.join(DIR_DATA, "True_dS.npy"), data["dS_true"])
+
+    best_cfg = None
+    sweep_df = None
+    df_k = None
+    df_lam = None
+
+    if cfg.do_sweep:
+        print("\n[2/6] Zentropy hyperparameter selection (Spatial Block CV; 1-SE)...")
+        best_cfg, sweep_df, df_k, df_lam = zentropy_full_grid_search_methodology(data, cfg)
+        sweep_df.to_csv(os.path.join(DIR_TABLES, "Zentropy_Sweep_FullGrid_BlockCV.csv"), index=False)
+        df_k.to_csv(os.path.join(DIR_TABLES, "Zentropy_Select_graph_k_BlockCV.csv"), index=False)
+        df_lam.to_csv(os.path.join(DIR_TABLES, "Zentropy_Select_Lambdas_BlockCV.csv"), index=False)
+
+        cfg.graph_k = best_cfg.graph_k
+        cfg.K_UPPER = int(best_cfg.K_UPPER)
+        cfg.z_K = int(cfg.K_UPPER)
+        cfg.lam_sparse = float(best_cfg.lam_sparse)
+        cfg.lam_balance = float(best_cfg.lam_sparse)
+        cfg.lam_mag = float(best_cfg.lam_mag)
+
+        with open(os.path.join(DIR_TABLES, "Best_Zentropy_Config.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "graph_k": int(cfg.graph_k),
+                "z_K": int(cfg.K_UPPER),
+                "lam_balance": float(cfg.lam_balance),
+                "lam_mag": float(cfg.lam_mag),
+                "selection_rule": "Block-CV + 1-SE on mean R²; smallest (k,K) within 1-SE; lambdas within 1-SE with anti-collapse tie-break"
+            }, f, indent=2)
+        print(f"[SELECT DONE] k={cfg.graph_k}, K_upper={cfg.K_UPPER}, ls={cfg.lam_sparse}, lm={cfg.lam_mag}")
+    else:
+        print("\n[2/6] Sweep disabled. Using defaults.")
+
+    edges_full = make_knn_edges(data["coords_std"], cfg.graph_k)
+
+    print("\n[3/6] Selecting GWR bandwidth ONCE...")
+    gwr_bw = select_gwr_bandwidth_once(data["coords_std"], data["X_std"], data["y_std"], cfg)
+    with open(os.path.join(DIR_TABLES, "GWR_Bandwidth.json"), "w", encoding="utf-8") as f:
+        json.dump({"gwr_bw": gwr_bw}, f, indent=2)
+    print(f"[GWR] selected bw = {gwr_bw}")
+
+    print("\n[4/6] Running CV benchmarking (Random + Spatial Block; leakage-free graphs; fold-wise scaling)...")
+    cv_long, _ = run_cv_all_models(data, cfg, edges_full, gwr_bw)
+    cv_long.to_csv(os.path.join(DIR_TABLES, "CV_FoldLevel_AllModels.csv"), index=False)
+
+    cv_summary = cv_long.groupby(["cv_type", "model"], as_index=False).agg(
+        r2_mean=("r2", "mean"), r2_std=("r2", "std"),
+        rmse_mean=("rmse", "mean"), rmse_std=("rmse", "std")
+    ).fillna(0.0)
+    cv_summary.to_csv(os.path.join(DIR_TABLES, "CV_Summary_AllModels.csv"), index=False)
+
+    print("\n[5/6] Fitting in-sample models (for figures + diagnostics)...")
+    preds_in, gwr_full, gwr_coeffs, model_dnn, model_gnn, model_z = fit_baselines_in_sample(
+        data, edges_full, cfg, gwr_bw
+    )
+
+    # save models
+    torch.save(model_dnn.state_dict(), os.path.join(DIR_MODELS, "DNN_in_sample.pt"))
+    torch.save(model_gnn.state_dict(), os.path.join(DIR_MODELS, "GNN_in_sample.pt"))
+    torch.save(model_z.state_dict(), os.path.join(DIR_MODELS, "Zentropy_in_sample.pt"))
+
+    # Zentropy internals (in-sample)
+    data_dict_in = {"X": data["X_std"], "y": data["y_std"], "coords": data["coords_std"]}
+    yhat_z, p, F_k, E_k, S_k, E_pred_raw, S_pred_raw, unc_raw = zentropy_internals(model_z, data_dict_in, edges_full, cfg)
+
+    true_reg = data["regimes_true"].astype(int)
+    pred_reg_raw = np.argmax(p, axis=1).astype(int)
+
+    # align regime labels (pred -> true)
+    perm_map, conf = best_perm_match_true_pred(true_reg, pred_reg_raw)
+    p, F_k, E_k, S_k, pred_reg = apply_perm_to_zentropy_outputs(
+        p, F_k, E_k, S_k, pred_reg_raw, perm_map, K_true=int(np.max(true_reg) + 1)
+    )
+
+    # uncertainty / mean weights after permutation
+    unc = (-np.sum(p * np.log(p + 1e-12), axis=1)) / (np.log(p.shape[1]) + 1e-12)
+    unc = np.clip(unc, 0, 1)
+    mean_p = p.mean(0)
+
+    with open(os.path.join(DIR_TABLES, "Regime_Label_Mapping.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "perm_map_pred_to_true": {int(k): int(v) for k, v in perm_map.items()},
+            "confusion_true_by_pred": conf.tolist()
+        }, f, indent=2)
+
+    # mixture outputs
+    F_pred = yhat_z
+    E_pred = np.sum(p * E_k, axis=1)
+    S_pred = np.sum(p * S_k, axis=1)
+
+    F_pred_std = std_z(F_pred)
+    E_pred_std = std_z(E_pred)
+    S_pred_std = std_z(S_pred)
+
+    # gradients
+    dF_zen, dE_zen, dS_zen = zentropy_grads(model_z, data_dict_in, edges_full, cfg)
+
+    # save arrays
+    np.save(os.path.join(DIR_DATA, "Zentropy_p.npy"), p)
+    np.save(os.path.join(DIR_DATA, "Zentropy_dF.npy"), dF_zen)
+    np.save(os.path.join(DIR_DATA, "Zentropy_dE.npy"), dE_zen)
+    np.save(os.path.join(DIR_DATA, "Zentropy_dS.npy"), dS_zen)
+    np.save(os.path.join(DIR_DATA, "GWR_coeffs.npy"), gwr_coeffs)
+
+    print("\n[6/6] Generating ALL figures (no silent skipping; errors become error-PNGs)...")
+
+    # ---- Individual figures ----
+    safe_run_figure(
+        fig_B_true_overview_paper,
+        os.path.join(DIR_FIG, "FIG_B_TrueOverview.png"),
+        data["coords_std"], data["regimes_true"], data["y_std"], cfg
+    )
+
+    safe_run_figure(
+        fig_B_yx_scatter_panel,
+        os.path.join(DIR_FIG, "FIG_B_y_vs_x_scatter_TRUE.png"),
+        data["y_std"], data["X_std"], data["regimes_true"], cfg,
+        var_names=var_names, show_trends=cfg.FIGB_SHOW_TRENDS
+    )
+
+    safe_run_figure(
+        fig_B_dashboard_paper,
+        os.path.join(DIR_FIG, "FIG_B2_ZentropyDashboard.png"),
+        data["coords_std"], data["regimes_true"], pred_reg, unc, mean_p,
+        data["y_std"], F_pred_std, E_pred_std, S_pred_std, cfg
+    )
+
+    if cfg.do_sweep and df_k is not None:
+        safe_run_figure(
+            fig_E_sweep_k_curve,
+            os.path.join(DIR_FIG, "FIG_E_Select_graph_k_curve.png"),
+            df_k, cfg
+        )
+    if cfg.do_sweep and df_lam is not None:
+        safe_run_figure(
+            fig_E_sweep_lambda_heatmaps,
+            os.path.join(DIR_FIG, "FIG_E_Select_lambda_heatmaps.png"),
+            df_lam, cfg
+        )
+
+    safe_run_figure(
+        fig_C_true_vs_pred_FES,
+        os.path.join(DIR_FIG, "FIG_C_TrueVsPred_FES.png"),
+        data["coords_std"], data["F_true_std"], data["E_true_std"], data["S_true_std"],
+        F_pred_std, E_pred_std, S_pred_std, cfg
+    )
+
+    safe_run_figure(
+        fig_D_thermo_diagnostics,
+        os.path.join(DIR_FIG, "FIG_D_Thermodynamic_Diagnostics.png"),
+        data["dF_true"], dF_zen, dE_zen, dS_zen, var_names, cfg
+    )
+
+    # Residual diagnostics (returns df)
+    try:
+        df_moran = fig_G_residual_diagnostics(
+            data["coords_std"], data["y_std"], preds_in,
+            os.path.join(DIR_FIG, "FIG_G_residual_diagnostics_all_models.png"),
+            cfg
+        )
+        df_moran.to_csv(os.path.join(DIR_TABLES, "MoranResiduals_InSample_AllModels.csv"), index=False)
+    except Exception as e:
+        _safe_save_error_figure(
+            os.path.join(DIR_FIG, "FIG_G_residual_diagnostics_all_models.png"),
+            "fig_G_residual_diagnostics", e
+        )
+
+    safe_run_figure(
+        fig_H2_sensitivity_maps_true_zentropy_fes_vs_gwr,
+        os.path.join(DIR_FIG, "FIG_H2_SensitivityMaps_True_Zentropy_FES_vs_GWR.png"),
+        data["coords_std"],
+        data["dY_true_std"],
+        dF_zen, dE_zen, dS_zen,
+        gwr_coeffs,
+        cfg,
+        var_names=var_names,
+        point_scale=0.40
+    )
+
+    # ---- IMPORTANT FIX: define composite paths BEFORE calling fig_I / fig_2 ----
+    def _exists_or_none(p):
+        return p if (p is not None and os.path.exists(p)) else None
+
+    # FIG_I uses 6 panels (A..F)
+    path_I_A = _exists_or_none(os.path.join(DIR_FIG, "FIG_B_TrueOverview.png"))
+    path_I_B = _exists_or_none(os.path.join(DIR_FIG, "FIG_B2_ZentropyDashboard.png"))
+    path_I_C = _exists_or_none(os.path.join(DIR_FIG, "FIG_B_y_vs_x_scatter_TRUE.png"))
+    path_I_D = _exists_or_none(os.path.join(DIR_FIG, "FIG_C_TrueVsPred_FES.png"))
+    path_I_E = _exists_or_none(os.path.join(DIR_FIG, "FIG_H2_SensitivityMaps_True_Zentropy_FES_vs_GWR.png"))
+    path_I_F = _exists_or_none(os.path.join(DIR_FIG, "FIG_G_residual_diagnostics_all_models.png"))
+
+    safe_run_figure(
+        fig_I_simulation_composite,
+        os.path.join(DIR_FIG, "FIG_I_Simulation_Composite.png"),
+        cfg, path_I_A, path_I_B, path_I_C, path_I_D, path_I_E, path_I_F
+    )
+
+    # FIG_2 uses 5 image panels + draws CV itself
+    path2_A = path_I_A
+    path2_B = path_I_B
+    path2_C = path_I_C
+    path2_D = path_I_E
+    path2_E = path_I_F
+
+    safe_run_figure(
+        fig_2_simulation_composite,
+        os.path.join(DIR_FIG, "FIG_2_Simulation_Composite.png"),
+        cfg, path2_A, path2_B, path2_C, path2_D, path2_E, cv_summary
+    )
+
+    print("\n[ALL DONE] Outputs saved under:")
+    print(f" - {OUT}")
+    print("Key outputs:")
+    print(" - DATA/SimData.csv")
+    print(" - TABLES/CV_Summary_AllModels.csv")
+    print(" - FIGURES/ (all figures, including composites)")
+    if not _HAVE_MORAN:
+        print("\n[NOTE] libpysal/esda not installed -> Moran's I will be NA (fig still produced).")
+
+if __name__ == "__main__":
+    main()
